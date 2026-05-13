@@ -37,7 +37,7 @@ class MomentumTests(unittest.TestCase):
 
         self.assertEqual([ticker.symbol for ticker in ranked], ["BBB-USDT", "AAA-USDT"])
 
-    def test_candidate_requires_news_or_polymarket_confirmation(self):
+    def test_candidate_can_trade_without_info_confirmation(self):
         ticker = MarketTicker("BTC-USDT", 120, 100, 130, 95, 10_000_000, 1)
 
         without_info = CandidateScorer().score([ticker], [])
@@ -46,9 +46,16 @@ class MomentumTests(unittest.TestCase):
             [InfoSignal("news", "BTC-USDT", 1.0, "Bitcoin breaks higher")],
         )
 
-        self.assertFalse(without_info[0].confirmed)
+        self.assertTrue(without_info[0].confirmed)
         self.assertTrue(with_info[0].confirmed)
         self.assertGreater(with_info[0].total_score, without_info[0].total_score)
+
+    def test_candidate_can_still_require_news_confirmation(self):
+        ticker = MarketTicker("BTC-USDT", 120, 100, 130, 95, 10_000_000, 1)
+
+        candidate = CandidateScorer(require_info_confirmation=True).score([ticker], [])[0]
+
+        self.assertFalse(candidate.confirmed)
 
     def test_polymarket_confirmation_must_match_token(self):
         self.assertTrue(_is_crypto_market("Will Bitcoin hit a new high?", "BTC"))

@@ -152,6 +152,9 @@ class PolymarketSignalClient:
 
 
 class CandidateScorer:
+    def __init__(self, require_info_confirmation: bool = False) -> None:
+        self.require_info_confirmation = require_info_confirmation
+
     def score(
         self,
         tickers: Iterable[MarketTicker],
@@ -171,8 +174,8 @@ class CandidateScorer:
                 + ticker.amplitude_pct_24h * 50.0
                 + math.log10(max(ticker.volume_quote_24h, 1.0))
             )
-            confirmed = news_score > 0 or polymarket_score > 0
-            total_score = market_score + news_score * 4.0 + polymarket_score * 3.0
+            confirmed = news_score > 0 or not self.require_info_confirmation
+            total_score = market_score + news_score * 4.0
             reason = _candidate_reason(ticker, news_score, polymarket_score, confirmed)
             candidates.append(
                 CandidateScore(
@@ -199,7 +202,7 @@ def run_momentum_scan(settings: Settings, exchange: OkxRestClient) -> MomentumSc
     news_signals = NewsSignalClient(settings.news_rss_urls).fetch(symbols)
     polymarket_signals = PolymarketSignalClient(settings.polymarket_enabled).fetch(symbols)
     info_signals = news_signals + polymarket_signals
-    candidates = CandidateScorer().score(tickers, info_signals)
+    candidates = CandidateScorer(settings.require_info_confirmation).score(tickers, info_signals)
     return MomentumScan(tickers=tickers, info_signals=info_signals, candidates=candidates)
 
 
