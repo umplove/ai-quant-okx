@@ -133,6 +133,21 @@ class AiReviewerTests(unittest.TestCase):
 
         self.assertEqual(_extract_ai_text(payload), "继续运行")
 
+    def test_summarizes_reasoning_when_chat_content_is_empty(self):
+        payload = {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "当前无持仓，风险低，可以允许规则策略继续运行。",
+                    },
+                }
+            ]
+        }
+
+        self.assertIn("允许规则策略", _extract_ai_text(payload))
+
     def test_extracts_anthropic_text(self):
         payload = {"content": [{"type": "text", "text": "停止"}]}
 

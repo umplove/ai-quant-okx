@@ -75,7 +75,7 @@ class AiReviewClient:
                 "model": self.settings.openai_model,
                 "system": _instructions(),
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 700,
+                "max_tokens": self.settings.ai_review_max_tokens,
             }
         if self.settings.openai_api_mode == "chat":
             return {
@@ -84,13 +84,13 @@ class AiReviewClient:
                     {"role": "system", "content": _instructions()},
                     {"role": "user", "content": prompt},
                 ],
-                "max_tokens": 700,
+                "max_tokens": self.settings.ai_review_max_tokens,
             }
         return {
             "model": self.settings.openai_model,
             "instructions": _instructions(),
             "input": prompt,
-            "max_output_tokens": 700,
+            "max_output_tokens": self.settings.ai_review_max_tokens,
         }
 
     def _headers(self) -> dict[str, str]:
@@ -109,7 +109,7 @@ class AiReviewClient:
 def _instructions() -> str:
     return (
         "你是一个加密货币模拟盘资金复盘助手。只关心钱：权益、盈亏、风险敞口、是否应该继续让规则策略运行。"
-        "输出中文，必须非常短，最多3句话。不要列候选币长名单，不要讲无关市场新闻。"
+        "输出中文，必须先给最终结论，最多3句话。不要列候选币长名单，不要讲无关市场新闻。"
         "不要要求扩大仓位，不要建议移除止损，不要声称一定盈利。"
     )
 
@@ -197,14 +197,27 @@ def _extract_chat_text(payload: dict) -> str:
     for choice in payload.get("choices", []):
         message = choice.get("message", {})
         content = message.get("content")
-        if isinstance(content, str):
+        if isinstance(content, str) and content.strip():
             chunks.append(content)
         elif isinstance(content, list):
             for item in content:
                 text = item.get("text") if isinstance(item, dict) else None
                 if isinstance(text, str):
                     chunks.append(text)
+        if not chunks:
+            reasoning = message.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning.strip():
+                chunks.append(_summarize_reasoning_fallback(reasoning))
     return "\n".join(chunks)
+
+
+def _summarize_reasoning_fallback(text: str) -> str:
+    compact = " ".join(text.split())
+    if any(word in compact for word in ("停止", "风险偏高", "不建议", "暂不")):
+        return "AI资金结论: 风险偏高，建议停止新交易。"
+    if any(word in compact for word in ("允许", "继续运行", "风险低", "风险可控")):
+        return "AI资金结论: 资金风险可控，允许规则策略按原风控继续运行。"
+    return "AI资金结论: 已收到模型推理，但未生成最终结论，建议继续观察。"
 
 
 def _extract_output_text(payload: dict) -> str:

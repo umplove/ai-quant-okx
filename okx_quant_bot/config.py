@@ -87,6 +87,7 @@ class Settings:
     openai_model: str = "gpt-5.2"
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_mode: str = "responses"
+    ai_review_max_tokens: int = 2000
     ai_review_enabled: bool = False
     ai_review_interval_scans: int = 1
     ai_review_max_candidates: int = 5
@@ -144,6 +145,7 @@ class Settings:
             openai_model=os.getenv("OPENAI_MODEL", "gpt-5.2"),
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
             openai_api_mode=os.getenv("OPENAI_API_MODE", "responses").strip().lower(),
+            ai_review_max_tokens=_int("AI_REVIEW_MAX_TOKENS", 2000),
             ai_review_enabled=_bool(os.getenv("AI_REVIEW_ENABLED"), False),
             ai_review_interval_scans=_int("AI_REVIEW_INTERVAL_SCANS", 1),
             ai_review_max_candidates=_int("AI_REVIEW_MAX_CANDIDATES", 5),
@@ -168,6 +170,8 @@ class Settings:
             raise ValueError("MONEY_REPORT_INTERVAL_SCANS must be positive.")
         if self.openai_api_mode not in {"responses", "chat", "anthropic"}:
             raise ValueError("OPENAI_API_MODE must be responses, chat, or anthropic.")
+        if self.ai_review_max_tokens <= 0:
+            raise ValueError("AI_REVIEW_MAX_TOKENS must be positive.")
         if self.ai_review_interval_scans <= 0:
             raise ValueError("AI_REVIEW_INTERVAL_SCANS must be positive.")
         if self.ai_review_max_candidates <= 0:
