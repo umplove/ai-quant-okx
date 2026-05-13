@@ -91,8 +91,6 @@ class IntelligenceRadar:
         items.extend(self._scan_fear_greed(symbols))
         items.extend(self._scan_binance_announcements(symbols))
         items.extend(self._scan_okx_announcements(symbols))
-        items.extend(self._scan_cryptopanic(symbols))
-        items.extend(self._scan_coinmarketcal(symbols))
         deduped = _dedupe(items)
         return IntelligenceScan(deduped[: self.settings.intelligence_max_items])
 
@@ -192,63 +190,6 @@ class IntelligenceRadar:
                     items.append(_item("okx_announcement", symbol, title, OKX_ANNOUNCEMENTS_URL, {"title": title}))
         return items
 
-    def _scan_cryptopanic(self, symbols: tuple[str, ...]) -> list[IntelligenceItem]:
-        if not self.settings.cryptopanic_auth_token:
-            return []
-        url = self.settings.cryptopanic_base_url + "?" + urllib.parse.urlencode(
-            {"auth_token": self.settings.cryptopanic_auth_token, "public": "true"}
-        )
-        try:
-            payload = json.loads(_http_get(url, timeout=self.timeout))
-        except Exception:
-            return []
-        rows = payload.get("results", []) if isinstance(payload, dict) else []
-        items: list[IntelligenceItem] = []
-        for row in rows[:100]:
-            title = str(row.get("title") or "")
-            link = str(row.get("url") or row.get("domain") or "")
-            currencies = {
-                str(c.get("code") or "").upper()
-                for c in row.get("currencies", [])
-                if isinstance(c, dict)
-            }
-            for symbol in symbols:
-                base = _base(symbol)
-                if base in currencies or _matches_symbol(title, symbol):
-                    items.append(_item("cryptopanic", symbol, title, link, row))
-        return items
-
-    def _scan_coinmarketcal(self, symbols: tuple[str, ...]) -> list[IntelligenceItem]:
-        if not self.settings.coinmarketcal_api_key:
-            return []
-        url = "https://developers.coinmarketcal.com/v1/events?" + urllib.parse.urlencode(
-            {"max": str(min(self.settings.intelligence_max_items, 75)), "sortBy": "trending_events"}
-        )
-        try:
-            raw = _http_get(
-                url,
-                timeout=self.timeout,
-                headers={
-                    "x-api-key": self.settings.coinmarketcal_api_key,
-                    "Accept": "application/json",
-                },
-            )
-            payload = json.loads(raw)
-        except Exception:
-            return []
-        rows = payload.get("body", []) if isinstance(payload, dict) else []
-        items: list[IntelligenceItem] = []
-        for row in rows:
-            title = _localized(row.get("title")) or str(row.get("title") or "")
-            link = str(row.get("source") or "")
-            coins = row.get("coins", []) if isinstance(row, dict) else []
-            coin_symbols = {str(c.get("symbol") or c.get("name") or "").upper() for c in coins}
-            for symbol in symbols:
-                base = _base(symbol)
-                if base in coin_symbols or _matches_symbol(title, symbol):
-                    items.append(_item("coinmarketcal", symbol, title, link, row))
-        return items
-
 
 def _item(source: str, symbol: str, title: str, url: str, raw, score: float | None = None) -> IntelligenceItem:
     return IntelligenceItem(
@@ -345,12 +286,6 @@ def _child_text(item: ET.Element, name: str) -> str:
     if name == "link" and child.text is None:
         return str(child.attrib.get("href", ""))
     return (child.text or "").strip()
-
-
-def _localized(value) -> str:
-    if isinstance(value, dict):
-        return str(value.get("en") or next(iter(value.values()), ""))
-    return ""
 
 
 def _floatish(value: object) -> float:

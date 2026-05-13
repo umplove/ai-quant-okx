@@ -47,31 +47,6 @@ class IntelligenceTests(unittest.TestCase):
         self.assertEqual(scan.items[0].symbol, "BTC-USDT")
         self.assertGreater(scan.signals[0].score, 1)
 
-    def test_cryptopanic_items_match_currencies(self):
-        payload = {
-            "results": [
-                {
-                    "title": "Ethereum mainnet upgrade",
-                    "url": "https://example.test/eth",
-                    "currencies": [{"code": "ETH"}],
-                }
-            ]
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            settings = settings_for(Path(tmp) / "bot.sqlite3")
-            settings = settings.__class__(
-                **{
-                    **settings.__dict__,
-                    "cryptopanic_auth_token": "token",
-                    "news_scan_aggressive": False,
-                }
-            )
-            with patch("urllib.request.urlopen", return_value=_Response(json.dumps(payload))):
-                scan = IntelligenceRadar(settings).scan(("BTC-USDT", "ETH-USDT"))
-
-        self.assertEqual(scan.items[0].source, "cryptopanic")
-        self.assertEqual(scan.items[0].symbol, "ETH-USDT")
-
     def test_public_sources_need_no_keys(self):
         responses = {
             intelligence.COINGECKO_TRENDING_URL: json.dumps(
@@ -109,8 +84,6 @@ class IntelligenceTests(unittest.TestCase):
                     **settings.__dict__,
                     "news_rss_urls": (),
                     "news_scan_aggressive": True,
-                    "cryptopanic_auth_token": "",
-                    "coinmarketcal_api_key": "",
                 }
             )
             with patch("okx_quant_bot.intelligence._http_get", side_effect=fake_get):
