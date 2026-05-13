@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from okx_quant_bot.ai_reviewer import AiReviewClient, _extract_output_text
+from okx_quant_bot.ai_reviewer import AiReviewClient, _extract_ai_text, _extract_output_text
 from okx_quant_bot.models import CandidateScore, InfoSignal, MarketTicker
 from okx_quant_bot.momentum import MomentumScan
 from tests.test_strategy_risk import settings_for
@@ -46,6 +46,39 @@ class AiReviewerTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         auth = calls[0][0].headers["Authorization"]
         self.assertEqual(auth, "Bearer secret-key")
+        self.assertTrue(calls[0][0].full_url.endswith("/responses"))
+
+    def test_review_scan_posts_chat_completions_request(self):
+        calls = []
+
+        def opener(request, timeout):
+            calls.append((request, timeout))
+            body = json.loads(request.data.decode("utf-8"))
+            self.assertEqual(body["model"], "MiMo-V2.5-Pro")
+            self.assertIn("messages", body)
+            self.assertIn("BTC-USDT", body["messages"][1]["content"])
+            self.assertNotIn("secret-key", body["messages"][1]["content"])
+            return json.dumps(
+                {"choices": [{"message": {"content": "资金风险可控，继续按风控运行。"}}]}
+            ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = settings_for(Path(tmp) / "bot.sqlite3")
+            settings = settings.__class__(
+                **{
+                    **settings.__dict__,
+                    "ai_review_enabled": True,
+                    "openai_api_key": "secret-key",
+                    "openai_model": "MiMo-V2.5-Pro",
+                    "openai_base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+                    "openai_api_mode": "chat",
+                }
+            )
+            review = AiReviewClient(settings, opener=opener).review_scan(_scan(), open_position_count=0)
+
+        self.assertTrue(review.ok)
+        self.assertEqual(review.text, "资金风险可控，继续按风控运行。")
+        self.assertTrue(calls[0][0].full_url.endswith("/chat/completions"))
 
     def test_extracts_nested_output_text(self):
         payload = {
@@ -60,6 +93,11 @@ class AiReviewerTests(unittest.TestCase):
         }
 
         self.assertEqual(_extract_output_text(payload), "第一段\n第二段")
+
+    def test_extracts_chat_completion_text(self):
+        payload = {"choices": [{"message": {"content": "继续运行"}}]}
+
+        self.assertEqual(_extract_ai_text(payload), "继续运行")
 
 
 def _scan() -> MomentumScan:

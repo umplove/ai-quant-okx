@@ -35,14 +35,10 @@ class AiReviewClient:
         if not self.enabled:
             return AiReview(False, "", "AI review is disabled or OPENAI_API_KEY is missing.")
 
-        body = {
-            "model": self.settings.openai_model,
-            "instructions": _instructions(),
-            "input": _scan_prompt(self.settings, scan, open_position_count),
-            "max_output_tokens": 700,
-        }
+        prompt = _scan_prompt(self.settings, scan, open_position_count)
+        body = self._request_body(prompt)
         request = urllib.request.Request(
-            f"{self.settings.openai_base_url}/responses",
+            self._request_url(),
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             method="POST",
             headers={
@@ -55,7 +51,7 @@ class AiReviewClient:
         try:
             raw = self._opener(request, 30.0)
             payload = json.loads(raw.decode("utf-8"))
-            text = _extract_output_text(payload).strip()
+            text = _extract_ai_text(payload).strip()
             if not text:
                 return AiReview(False, "", "OpenAI response did not contain output text.")
             return AiReview(True, _telegram_sized(text))
@@ -64,6 +60,27 @@ class AiReviewClient:
             return AiReview(False, "", f"OpenAI HTTP {exc.code}: {detail}")
         except Exception as exc:
             return AiReview(False, "", f"OpenAI review failed: {exc}")
+
+    def _request_url(self) -> str:
+        path = "chat/completions" if self.settings.openai_api_mode == "chat" else "responses"
+        return f"{self.settings.openai_base_url}/{path}"
+
+    def _request_body(self, prompt: str) -> dict:
+        if self.settings.openai_api_mode == "chat":
+            return {
+                "model": self.settings.openai_model,
+                "messages": [
+                    {"role": "system", "content": _instructions()},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": 700,
+            }
+        return {
+            "model": self.settings.openai_model,
+            "instructions": _instructions(),
+            "input": prompt,
+            "max_output_tokens": 700,
+        }
 
 
 def _instructions() -> str:
@@ -124,6 +141,28 @@ def _group_info(signals: list[InfoSignal]) -> dict[str, list[InfoSignal]]:
     for signal in signals:
         grouped.setdefault(signal.symbol, []).append(signal)
     return grouped
+
+
+def _extract_ai_text(payload: dict) -> str:
+    chat_text = _extract_chat_text(payload)
+    if chat_text:
+        return chat_text
+    return _extract_output_text(payload)
+
+
+def _extract_chat_text(payload: dict) -> str:
+    chunks: list[str] = []
+    for choice in payload.get("choices", []):
+        message = choice.get("message", {})
+        content = message.get("content")
+        if isinstance(content, str):
+            chunks.append(content)
+        elif isinstance(content, list):
+            for item in content:
+                text = item.get("text") if isinstance(item, dict) else None
+                if isinstance(text, str):
+                    chunks.append(text)
+    return "\n".join(chunks)
 
 
 def _extract_output_text(payload: dict) -> str:
