@@ -1,0 +1,4 @@
+# Core runtime intentionally uses Python standard library only.
+# Optional WebSocket support:
+# websockets>=12.0
+

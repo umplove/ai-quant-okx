@@ -1,0 +1,10 @@
+services:
+  okx-quant-bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    command: ["python", "-m", "okx_quant_bot", "run"]
+

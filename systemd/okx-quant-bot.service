@@ -1,0 +1,16 @@
+[Unit]
+Description=OKX Demo Quant Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/okx-quant-bot
+EnvironmentFile=/opt/okx-quant-bot/.env
+ExecStart=/usr/bin/python3 -m okx_quant_bot run
+Restart=always
+RestartSec=10
+User=okxbot
+
+[Install]
+WantedBy=multi-user.target
+
