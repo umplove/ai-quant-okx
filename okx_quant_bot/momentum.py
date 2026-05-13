@@ -13,6 +13,7 @@ from typing import Iterable
 
 from okx_quant_bot.config import Settings
 from okx_quant_bot.exchange import OkxRestClient
+from okx_quant_bot.intelligence import IntelligenceItem, IntelligenceRadar
 from okx_quant_bot.models import CandidateScore, InfoSignal, MarketTicker, StopLossPlan
 
 
@@ -54,6 +55,7 @@ class MomentumScan:
     tickers: list[MarketTicker]
     info_signals: list[InfoSignal]
     candidates: list[CandidateScore]
+    intelligence_items: list[IntelligenceItem] | None = None
 
     @property
     def best(self) -> CandidateScore | None:
@@ -208,9 +210,15 @@ def run_momentum_scan(settings: Settings, exchange: OkxRestClient) -> MomentumSc
     news_urls = settings.news_rss_urls or (DEFAULT_NEWS_RSS_URLS if settings.news_scan_aggressive else ())
     news_signals = NewsSignalClient(news_urls).fetch(symbols)
     polymarket_signals = PolymarketSignalClient(settings.polymarket_enabled).fetch(symbols)
-    info_signals = news_signals + polymarket_signals
+    intelligence_scan = IntelligenceRadar(settings).scan(symbols)
+    info_signals = news_signals + polymarket_signals + intelligence_scan.signals
     candidates = CandidateScorer(settings.require_info_confirmation).score(tickers, info_signals)
-    return MomentumScan(tickers=tickers, info_signals=info_signals, candidates=candidates)
+    return MomentumScan(
+        tickers=tickers,
+        info_signals=info_signals,
+        candidates=candidates,
+        intelligence_items=intelligence_scan.items,
+    )
 
 
 def target_position_usdt(settings: Settings) -> float:

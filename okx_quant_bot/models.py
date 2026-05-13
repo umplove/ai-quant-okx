@@ -152,6 +152,29 @@ class InfoSignal:
 
 
 @dataclass(frozen=True)
+class IntelligenceItem:
+    source: str
+    symbol: str
+    title: str
+    url: str
+    score: float
+    raw: str = ""
+
+
+@dataclass(frozen=True)
+class TradeReview:
+    symbol: str
+    phase: str
+    entry_price: float
+    current_price: float
+    size: float
+    pnl_usdt: float
+    return_pct: float
+    summary: str
+    raw: str = ""
+
+
+@dataclass(frozen=True)
 class CandidateScore:
     symbol: str
     price: float

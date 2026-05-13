@@ -12,6 +12,7 @@ from okx_quant_bot.momentum import MomentumScan, run_momentum_scan, stop_loss_pl
 from okx_quant_bot.notify import Notifier
 from okx_quant_bot.risk import RiskManager
 from okx_quant_bot.runner import _order_failed_message, _order_recorded_message
+from okx_quant_bot.trade_review import TradeReviewEngine
 
 
 @dataclass
@@ -52,7 +53,9 @@ class MomentumBotRunner:
         scan = run_momentum_scan(self.settings, self.exchange)
         self.storage.save_market_snapshots(scan.tickers)
         self.storage.save_info_signals(scan.info_signals)
+        self.storage.save_intelligence_items(scan.intelligence_items or [])
         self.storage.save_candidate_scores(scan.candidates)
+        self._review_open_trades(scan)
 
         if self.settings.telegram_money_only:
             ai_note = self._ai_review_text(scan)
@@ -214,8 +217,29 @@ class MomentumBotRunner:
         if count % self.settings.ai_review_interval_scans != 0:
             return ""
         memory = "\n".join(self.storage.active_strategy_lessons())
-        review = AiReviewClient(self.settings).review_scan(scan, self.storage.open_position_count(), memory)
+        reviews = "\n".join(self.storage.recent_trade_reviews())
+        intel = "\n".join(self.storage.recent_intelligence())
+        context = "\n".join(part for part in (memory, reviews, intel) if part)
+        review = AiReviewClient(self.settings).review_scan(scan, self.storage.open_position_count(), context)
         return review.text if review.ok else f"AI unavailable: {review.error}"
+
+    def _review_open_trades(self, scan: MomentumScan) -> None:
+        if not self.settings.trade_review_enabled:
+            return
+        reviews = TradeReviewEngine().mark_to_market(
+            self.storage.open_positions(),
+            scan.tickers,
+            note="auto review",
+        )
+        for review in reviews:
+            self.storage.save_trade_review(review)
+            self.storage.save_strategy_lesson(
+                review.symbol,
+                review.pnl_usdt,
+                review.return_pct,
+                review.summary,
+                review.raw,
+            )
 
     def _send_money_report(
         self,

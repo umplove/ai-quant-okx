@@ -77,6 +77,11 @@ class Settings:
     max_open_positions: int = 1
     news_rss_urls: tuple[str, ...] = ()
     news_scan_aggressive: bool = True
+    cryptopanic_auth_token: str = ""
+    cryptopanic_base_url: str = "https://cryptopanic.com/api/v1/posts/"
+    coinmarketcal_api_key: str = ""
+    intelligence_max_items: int = 30
+    trade_review_enabled: bool = True
     polymarket_enabled: bool = True
     binance_square_enabled: bool = False
     require_info_confirmation: bool = False
@@ -135,6 +140,11 @@ class Settings:
             max_open_positions=_int("MAX_OPEN_POSITIONS", 1),
             news_rss_urls=_csv("NEWS_RSS_URLS"),
             news_scan_aggressive=_bool(os.getenv("NEWS_SCAN_AGGRESSIVE"), True),
+            cryptopanic_auth_token=os.getenv("CRYPTOPANIC_AUTH_TOKEN", ""),
+            cryptopanic_base_url=os.getenv("CRYPTOPANIC_BASE_URL", "https://cryptopanic.com/api/v1/posts/"),
+            coinmarketcal_api_key=os.getenv("COINMARKETCAL_API_KEY", ""),
+            intelligence_max_items=_int("INTELLIGENCE_MAX_ITEMS", 30),
+            trade_review_enabled=_bool(os.getenv("TRADE_REVIEW_ENABLED"), True),
             polymarket_enabled=_bool(os.getenv("POLYMARKET_ENABLED"), False),
             binance_square_enabled=_bool(os.getenv("BINANCE_SQUARE_ENABLED"), False),
             require_info_confirmation=_bool(os.getenv("REQUIRE_INFO_CONFIRMATION"), False),
@@ -168,6 +178,8 @@ class Settings:
             raise ValueError("Risk settings must be positive.")
         if self.money_report_interval_scans <= 0:
             raise ValueError("MONEY_REPORT_INTERVAL_SCANS must be positive.")
+        if self.intelligence_max_items <= 0:
+            raise ValueError("INTELLIGENCE_MAX_ITEMS must be positive.")
         if self.openai_api_mode not in {"responses", "chat", "anthropic"}:
             raise ValueError("OPENAI_API_MODE must be responses, chat, or anthropic.")
         if self.ai_review_max_tokens <= 0:

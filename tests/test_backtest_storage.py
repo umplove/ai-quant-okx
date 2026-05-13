@@ -4,7 +4,7 @@ from pathlib import Path
 
 from okx_quant_bot.backtest import run_backtest
 from okx_quant_bot.data import Storage
-from okx_quant_bot.models import Candle
+from okx_quant_bot.models import Candle, IntelligenceItem, Position, TradeReview
 from okx_quant_bot.strategy import TrendPullbackStrategy
 
 
@@ -42,6 +42,34 @@ class BacktestStorageTests(unittest.TestCase):
         self.assertEqual(len(lessons), 1)
         self.assertIn("BTC-USDT", lessons[0])
         self.assertIn("follow momentum", lessons[0])
+
+    def test_intelligence_and_trade_reviews_are_saved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "bot.sqlite3")
+            storage.init()
+            storage.save_intelligence_items(
+                [IntelligenceItem("rss", "BTC-USDT", "Bitcoin listing", "u", 2.0)]
+            )
+            storage.save_trade_review(
+                TradeReview("BTC-USDT", "mark", 100, 110, 1, 10, 10, "profit")
+            )
+
+            intel = storage.recent_intelligence()
+            reviews = storage.recent_trade_reviews()
+
+        self.assertIn("Bitcoin listing", intel[0])
+        self.assertIn("BTC-USDT", reviews[0])
+
+    def test_open_positions_returns_only_live_positions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "bot.sqlite3")
+            storage.init()
+            storage.save_position(Position("BTC-USDT", 1, 100, 100))
+            storage.save_position(Position("ETH-USDT"))
+
+            positions = storage.open_positions()
+
+        self.assertEqual([p.symbol for p in positions], ["BTC-USDT"])
 
 
 if __name__ == "__main__":

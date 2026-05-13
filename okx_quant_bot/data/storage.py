@@ -9,12 +9,14 @@ from okx_quant_bot.models import (
     Candle,
     CandidateScore,
     InfoSignal,
+    IntelligenceItem,
     MarketTicker,
     OrderRequest,
     OrderResult,
     Position,
     Signal,
     StopLossOrder,
+    TradeReview,
 )
 
 
@@ -156,6 +158,32 @@ class Storage:
                     pnl_usdt real not null,
                     return_pct real not null,
                     active integer not null,
+                    summary text not null,
+                    raw text not null,
+                    created_at text default current_timestamp
+                );
+
+                create table if not exists intelligence_items (
+                    id integer primary key autoincrement,
+                    source text not null,
+                    symbol text not null,
+                    title text not null,
+                    url text not null,
+                    score real not null,
+                    raw text not null,
+                    created_at text default current_timestamp,
+                    unique(source, symbol, title, url)
+                );
+
+                create table if not exists trade_reviews (
+                    id integer primary key autoincrement,
+                    symbol text not null,
+                    phase text not null,
+                    entry_price real not null,
+                    current_price real not null,
+                    size real not null,
+                    pnl_usdt real not null,
+                    return_pct real not null,
                     summary text not null,
                     raw text not null,
                     created_at text default current_timestamp
@@ -335,6 +363,20 @@ class Storage:
             ).fetchone()
         return int(row["count"] if row is not None else 0)
 
+    def open_positions(self) -> list[Position]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select * from positions
+                where base_qty > 0 and avg_entry_price > 0
+                order by updated_at desc
+                """
+            ).fetchall()
+        return [
+            Position(row["symbol"], row["base_qty"], row["avg_entry_price"], row["highest_price"])
+            for row in rows
+        ]
+
     def save_position(self, position: Position) -> None:
         with self.session() as conn:
             conn.execute(
@@ -403,4 +445,66 @@ class Storage:
         return [
             f"{row['symbol']} pnl={row['pnl_usdt']:+.2f}USDT return={row['return_pct']:+.2f}%: {row['summary']}"
             for row in rows
+        ]
+
+    def save_intelligence_items(self, items: Iterable[IntelligenceItem]) -> None:
+        with self.session() as conn:
+            conn.executemany(
+                """
+                insert or ignore into intelligence_items(source, symbol, title, url, score, raw)
+                values (?, ?, ?, ?, ?, ?)
+                """,
+                [(i.source, i.symbol, i.title, i.url, i.score, i.raw) for i in items],
+            )
+
+    def recent_intelligence(self, limit: int = 20) -> list[str]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select source, symbol, title, score
+                from intelligence_items
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [f"{r['source']} {r['symbol']} score={r['score']:.1f}: {r['title']}" for r in rows]
+
+    def save_trade_review(self, review: TradeReview) -> None:
+        with self.session() as conn:
+            conn.execute(
+                """
+                insert into trade_reviews(
+                    symbol, phase, entry_price, current_price, size, pnl_usdt,
+                    return_pct, summary, raw
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    review.symbol,
+                    review.phase,
+                    review.entry_price,
+                    review.current_price,
+                    review.size,
+                    review.pnl_usdt,
+                    review.return_pct,
+                    review.summary[:1000],
+                    review.raw[:4000],
+                ),
+            )
+
+    def recent_trade_reviews(self, limit: int = 8) -> list[str]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select symbol, phase, pnl_usdt, return_pct, summary
+                from trade_reviews
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            f"{r['symbol']} {r['phase']} pnl={r['pnl_usdt']:+.2f}USDT "
+            f"return={r['return_pct']:+.2f}%: {r['summary']}"
+            for r in rows
         ]
