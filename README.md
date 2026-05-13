@@ -50,3 +50,16 @@ python -m okx_quant_bot run
 - 若要实盘，必须同时设置 `OKX_DEMO=false` 和 `ALLOW_LIVE_TRADING=true`，并自行承担风险。
 - 订单失败不会追单，机器人会记录异常并暂停对应交易动作。
 - 本项目不是投资建议，只是一个可验证、可复盘、可风控的自动交易流程。
+## AI review
+
+The bot can optionally call the OpenAI Responses API to produce Chinese review notes for momentum scans. AI review is read-only: it does not place orders, change risk limits, or bypass strategy rules.
+
+```env
+AI_REVIEW_ENABLED=true
+AI_REVIEW_INTERVAL_SCANS=12
+AI_REVIEW_MAX_CANDIDATES=5
+OPENAI_API_KEY=your_openai_api_key
+OPENAI_MODEL=gpt-5.2
+```
+
+With the default 300 second scan interval, `AI_REVIEW_INTERVAL_SCANS=12` sends one AI review about every hour.

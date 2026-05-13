@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from okx_quant_bot.config import Settings
 from okx_quant_bot.data import Storage
 from okx_quant_bot.exchange import OkxRestClient
+from okx_quant_bot.ai_reviewer import AiReviewClient
 from okx_quant_bot.models import CandidateScore, OrderResult, Position, Side, StopLossOrder
 from okx_quant_bot.momentum import (
     MomentumScan,
@@ -48,6 +49,7 @@ class MomentumBotRunner:
         self.storage.save_candidate_scores(scan.candidates)
         self._send_scan_summary(scan)
         self._send_daily_report(scan)
+        self._send_ai_review(scan)
 
         candidate = self._tradable_candidate(scan)
         if candidate is None:
@@ -173,6 +175,19 @@ class MomentumBotRunner:
         self.storage.save_daily_report(today, summary)
         self.storage.set_state(state_key, "sent")
         self.notifier.send(summary)
+
+    def _send_ai_review(self, scan: MomentumScan) -> None:
+        if not self.settings.ai_review_enabled:
+            return
+        count = int(self.storage.get_state("ai_review_scan_count", "0") or "0") + 1
+        self.storage.set_state("ai_review_scan_count", str(count))
+        if count % self.settings.ai_review_interval_scans != 0:
+            return
+        review = AiReviewClient(self.settings).review_scan(scan, self.storage.open_position_count())
+        if review.ok:
+            self.notifier.send("AI复盘：\n" + review.text)
+        else:
+            self.notifier.send(f"AI复盘暂不可用：{review.error}")
 
 
 def _momentum_start_message(okx_demo: bool, trading_enabled: bool) -> str:
