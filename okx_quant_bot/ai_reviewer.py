@@ -31,21 +31,22 @@ class AiReviewClient:
     def enabled(self) -> bool:
         return bool(self.settings.ai_review_enabled and self.settings.openai_api_key)
 
-    def review_scan(self, scan: MomentumScan, open_position_count: int) -> AiReview:
+    def review_scan(
+        self,
+        scan: MomentumScan,
+        open_position_count: int,
+        strategy_memory: str = "",
+    ) -> AiReview:
         if not self.enabled:
             return AiReview(False, "", "AI review is disabled or OPENAI_API_KEY is missing.")
 
-        prompt = _scan_prompt(self.settings, scan, open_position_count)
+        prompt = _scan_prompt(self.settings, scan, open_position_count, strategy_memory)
         body = self._request_body(prompt)
         request = urllib.request.Request(
             self._request_url(),
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             method="POST",
-            headers={
-                "Authorization": f"Bearer {self.settings.openai_api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "okx-quant-bot/0.1",
-            },
+            headers=self._headers(),
         )
 
         try:
@@ -62,10 +63,20 @@ class AiReviewClient:
             return AiReview(False, "", f"OpenAI review failed: {exc}")
 
     def _request_url(self) -> str:
-        path = "chat/completions" if self.settings.openai_api_mode == "chat" else "responses"
+        if self.settings.openai_api_mode == "anthropic":
+            path = "v1/messages"
+        else:
+            path = "chat/completions" if self.settings.openai_api_mode == "chat" else "responses"
         return f"{self.settings.openai_base_url}/{path}"
 
     def _request_body(self, prompt: str) -> dict:
+        if self.settings.openai_api_mode == "anthropic":
+            return {
+                "model": self.settings.openai_model,
+                "system": _instructions(),
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 700,
+            }
         if self.settings.openai_api_mode == "chat":
             return {
                 "model": self.settings.openai_model,
@@ -82,6 +93,18 @@ class AiReviewClient:
             "max_output_tokens": 700,
         }
 
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "okx-quant-bot/0.1",
+        }
+        if self.settings.openai_api_mode == "anthropic":
+            headers["x-api-key"] = self.settings.openai_api_key
+            headers["anthropic-version"] = "2023-06-01"
+        else:
+            headers["Authorization"] = f"Bearer {self.settings.openai_api_key}"
+        return headers
+
 
 def _instructions() -> str:
     return (
@@ -91,7 +114,12 @@ def _instructions() -> str:
     )
 
 
-def _scan_prompt(settings: Settings, scan: MomentumScan, open_position_count: int) -> str:
+def _scan_prompt(
+    settings: Settings,
+    scan: MomentumScan,
+    open_position_count: int,
+    strategy_memory: str = "",
+) -> str:
     candidates = scan.candidates[: settings.ai_review_max_candidates]
     info_by_symbol = _group_info(scan.info_signals)
     lines = [
@@ -103,6 +131,8 @@ def _scan_prompt(settings: Settings, scan: MomentumScan, open_position_count: in
         f"单笔风险预算: {settings.risk_per_trade_usdt:.2f} USDT; "
         f"止损模式: {settings.stop_mode}",
         f"扫描行情数: {len(scan.tickers)}; 信息信号数: {len(scan.info_signals)}",
+        "有效策略记忆:",
+        strategy_memory or "- 暂无",
         "候选币:",
     ]
     if not candidates:
@@ -144,10 +174,22 @@ def _group_info(signals: list[InfoSignal]) -> dict[str, list[InfoSignal]]:
 
 
 def _extract_ai_text(payload: dict) -> str:
+    anthropic_text = _extract_anthropic_text(payload)
+    if anthropic_text:
+        return anthropic_text
     chat_text = _extract_chat_text(payload)
     if chat_text:
         return chat_text
     return _extract_output_text(payload)
+
+
+def _extract_anthropic_text(payload: dict) -> str:
+    chunks: list[str] = []
+    for item in payload.get("content", []):
+        text = item.get("text") if isinstance(item, dict) else None
+        if isinstance(text, str):
+            chunks.append(text)
+    return "\n".join(chunks)
 
 
 def _extract_chat_text(payload: dict) -> str:

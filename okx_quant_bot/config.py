@@ -76,6 +76,7 @@ class Settings:
     fixed_stop_loss_usdt: float = 200.0
     max_open_positions: int = 1
     news_rss_urls: tuple[str, ...] = ()
+    news_scan_aggressive: bool = True
     polymarket_enabled: bool = True
     binance_square_enabled: bool = False
     require_info_confirmation: bool = False
@@ -132,6 +133,7 @@ class Settings:
             fixed_stop_loss_usdt=_float("FIXED_STOP_LOSS_USDT", 200.0),
             max_open_positions=_int("MAX_OPEN_POSITIONS", 1),
             news_rss_urls=_csv("NEWS_RSS_URLS"),
+            news_scan_aggressive=_bool(os.getenv("NEWS_SCAN_AGGRESSIVE"), True),
             polymarket_enabled=_bool(os.getenv("POLYMARKET_ENABLED"), False),
             binance_square_enabled=_bool(os.getenv("BINANCE_SQUARE_ENABLED"), False),
             require_info_confirmation=_bool(os.getenv("REQUIRE_INFO_CONFIRMATION"), False),
@@ -164,8 +166,8 @@ class Settings:
             raise ValueError("Risk settings must be positive.")
         if self.money_report_interval_scans <= 0:
             raise ValueError("MONEY_REPORT_INTERVAL_SCANS must be positive.")
-        if self.openai_api_mode not in {"responses", "chat"}:
-            raise ValueError("OPENAI_API_MODE must be responses or chat.")
+        if self.openai_api_mode not in {"responses", "chat", "anthropic"}:
+            raise ValueError("OPENAI_API_MODE must be responses, chat, or anthropic.")
         if self.ai_review_interval_scans <= 0:
             raise ValueError("AI_REVIEW_INTERVAL_SCANS must be positive.")
         if self.ai_review_max_candidates <= 0:

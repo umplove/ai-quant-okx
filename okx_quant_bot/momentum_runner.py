@@ -213,8 +213,9 @@ class MomentumBotRunner:
         self.storage.set_state("ai_review_scan_count", str(count))
         if count % self.settings.ai_review_interval_scans != 0:
             return ""
-        review = AiReviewClient(self.settings).review_scan(scan, self.storage.open_position_count())
-        return review.text if review.ok else f"AI不可用: {review.error}"
+        memory = "\n".join(self.storage.active_strategy_lessons())
+        review = AiReviewClient(self.settings).review_scan(scan, self.storage.open_position_count(), memory)
+        return review.text if review.ok else f"AI unavailable: {review.error}"
 
     def _send_money_report(
         self,
@@ -239,7 +240,17 @@ class MomentumBotRunner:
             lines.append(f"备注: {note}")
         if ai_note:
             lines.append("AI资金结论: " + _one_line(ai_note))
-        self.notifier.send_money("\n".join(lines))
+        message = "\n".join(lines)
+        self.notifier.send_money(message)
+        if scan is not None:
+            best = scan.best.symbol if scan.best else "NONE"
+            self.storage.save_strategy_lesson(
+                symbol=best,
+                pnl_usdt=float(snapshot["pnl"]),
+                return_pct=float(snapshot["return_pct"]),
+                summary=_one_line(ai_note or note or "资金快照"),
+                raw=message,
+            )
 
     def _money_snapshot(self) -> dict[str, float | str]:
         equity = self._account_equity()
@@ -274,9 +285,11 @@ class MomentumBotRunner:
     def _handle_controls(self) -> None:
         for action in self.notifier.poll_controls(self.storage):
             if action == "stopped":
-                self._send_money_report(note="按钮: 停止")
+                self._send_money_report(note="/stop 已停止所有新交易")
             elif action == "restarted":
-                self._send_money_report(note="按钮: 重新开始")
+                self._send_money_report(note="/start 已重新开始整盘统计")
+            elif action == "status":
+                self._send_money_report(note="/status")
 
     def _is_paused(self) -> bool:
         return self.storage.get_state("bot_paused", "0") == "1"

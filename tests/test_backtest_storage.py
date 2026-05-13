@@ -30,7 +30,19 @@ class BacktestStorageTests(unittest.TestCase):
         self.assertGreaterEqual(result.ending_cash, 0)
         self.assertGreaterEqual(result.max_drawdown_pct, 0)
 
+    def test_strategy_lessons_keep_winners(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "bot.sqlite3")
+            storage.init()
+            storage.save_strategy_lesson("BTC-USDT", 3.0, 0.3, "follow momentum")
+            storage.save_strategy_lesson("ETH-USDT", -1.0, -0.1, "bad entry")
+
+            lessons = storage.active_strategy_lessons()
+
+        self.assertEqual(len(lessons), 1)
+        self.assertIn("BTC-USDT", lessons[0])
+        self.assertIn("follow momentum", lessons[0])
+
 
 if __name__ == "__main__":
     unittest.main()
-

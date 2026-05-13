@@ -42,6 +42,12 @@ TOKEN_NAMES = {
     "TON": "toncoin",
 }
 
+DEFAULT_NEWS_RSS_URLS = (
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+)
+
 
 @dataclass(frozen=True)
 class MomentumScan:
@@ -199,7 +205,8 @@ def run_momentum_scan(settings: Settings, exchange: OkxRestClient) -> MomentumSc
     scanner = MarketScanner(exchange, settings)
     tickers = scanner.top_momentum_tickers()
     symbols = [ticker.symbol for ticker in tickers]
-    news_signals = NewsSignalClient(settings.news_rss_urls).fetch(symbols)
+    news_urls = settings.news_rss_urls or (DEFAULT_NEWS_RSS_URLS if settings.news_scan_aggressive else ())
+    news_signals = NewsSignalClient(news_urls).fetch(symbols)
     polymarket_signals = PolymarketSignalClient(settings.polymarket_enabled).fetch(symbols)
     info_signals = news_signals + polymarket_signals
     candidates = CandidateScorer(settings.require_info_confirmation).score(tickers, info_signals)

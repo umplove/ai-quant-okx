@@ -149,6 +149,17 @@ class Storage:
                     summary text not null,
                     created_at text default current_timestamp
                 );
+
+                create table if not exists strategy_lessons (
+                    id integer primary key autoincrement,
+                    symbol text not null,
+                    pnl_usdt real not null,
+                    return_pct real not null,
+                    active integer not null,
+                    summary text not null,
+                    raw text not null,
+                    created_at text default current_timestamp
+                );
                 """
             )
 
@@ -358,3 +369,38 @@ class Storage:
         with self.session() as conn:
             row = conn.execute("select value from bot_state where key = ?", (key,)).fetchone()
         return default if row is None else str(row["value"])
+
+    def save_strategy_lesson(
+        self,
+        symbol: str,
+        pnl_usdt: float,
+        return_pct: float,
+        summary: str,
+        raw: str = "",
+    ) -> None:
+        active = int(pnl_usdt > 0)
+        with self.session() as conn:
+            conn.execute(
+                """
+                insert into strategy_lessons(symbol, pnl_usdt, return_pct, active, summary, raw)
+                values (?, ?, ?, ?, ?, ?)
+                """,
+                (symbol, pnl_usdt, return_pct, active, summary[:1000], raw[:4000]),
+            )
+
+    def active_strategy_lessons(self, limit: int = 8) -> list[str]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select symbol, pnl_usdt, return_pct, summary
+                from strategy_lessons
+                where active = 1
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            f"{row['symbol']} pnl={row['pnl_usdt']:+.2f}USDT return={row['return_pct']:+.2f}%: {row['summary']}"
+            for row in rows
+        ]

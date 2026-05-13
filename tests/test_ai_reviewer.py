@@ -80,6 +80,40 @@ class AiReviewerTests(unittest.TestCase):
         self.assertEqual(review.text, "资金风险可控，继续按风控运行。")
         self.assertTrue(calls[0][0].full_url.endswith("/chat/completions"))
 
+    def test_review_scan_posts_anthropic_messages_request(self):
+        calls = []
+
+        def opener(request, timeout):
+            calls.append((request, timeout))
+            body = json.loads(request.data.decode("utf-8"))
+            self.assertEqual(body["model"], "mimo-v2.5-pro")
+            self.assertIn("system", body)
+            self.assertIn("BTC-USDT", body["messages"][0]["content"])
+            self.assertIn("赚钱经验", body["messages"][0]["content"])
+            return json.dumps({"content": [{"type": "text", "text": "继续运行，风险可控。"}]}).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = settings_for(Path(tmp) / "bot.sqlite3")
+            settings = settings.__class__(
+                **{
+                    **settings.__dict__,
+                    "ai_review_enabled": True,
+                    "openai_api_key": "secret-key",
+                    "openai_model": "mimo-v2.5-pro",
+                    "openai_base_url": "https://token-plan-cn.xiaomimimo.com/anthropic",
+                    "openai_api_mode": "anthropic",
+                }
+            )
+            review = AiReviewClient(settings, opener=opener).review_scan(
+                _scan(), open_position_count=0, strategy_memory="赚钱经验"
+            )
+
+        self.assertTrue(review.ok)
+        self.assertEqual(review.text, "继续运行，风险可控。")
+        self.assertTrue(calls[0][0].full_url.endswith("/v1/messages"))
+        self.assertEqual(calls[0][0].headers["X-api-key"], "secret-key")
+        self.assertEqual(calls[0][0].headers["Anthropic-version"], "2023-06-01")
+
     def test_extracts_nested_output_text(self):
         payload = {
             "output": [
@@ -98,6 +132,11 @@ class AiReviewerTests(unittest.TestCase):
         payload = {"choices": [{"message": {"content": "继续运行"}}]}
 
         self.assertEqual(_extract_ai_text(payload), "继续运行")
+
+    def test_extracts_anthropic_text(self):
+        payload = {"content": [{"type": "text", "text": "停止"}]}
+
+        self.assertEqual(_extract_ai_text(payload), "停止")
 
 
 def _scan() -> MomentumScan:
