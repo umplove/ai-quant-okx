@@ -68,10 +68,12 @@ class MarketScanner:
         self.settings = settings
 
     def top_momentum_tickers(self) -> list[MarketTicker]:
+        allowed_symbols = set(self.settings.symbols)
         tickers = [
             ticker
             for ticker in self.exchange.get_market_tickers("SPOT")
-            if _is_tradeable_usdt_symbol(ticker.symbol)
+            if ticker.symbol in allowed_symbols
+            and _is_tradeable_usdt_symbol(ticker.symbol)
             and ticker.change_pct_24h > 0
             and ticker.amplitude_pct_24h > 0
             and ticker.volume_quote_24h > 0

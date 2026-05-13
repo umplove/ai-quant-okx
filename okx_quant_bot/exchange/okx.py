@@ -129,6 +129,23 @@ class OkxRestClient:
         )
         return order, self.place_order(order)
 
+    def place_market_sell_base(
+        self,
+        symbol: str,
+        base_size: float,
+        reason: str,
+    ) -> tuple[OrderRequest, OrderResult]:
+        order = OrderRequest(
+            symbol=symbol,
+            side=Side.SELL,
+            size=base_size,
+            order_type="market",
+            price=None,
+            client_order_id=self.client_order_id("MS", symbol),
+            reason=reason,
+        )
+        return order, self.place_order(order)
+
     def place_stop_loss_order(self, symbol: str, size: float, stop_price: float) -> StopLossOrder:
         client_order_id = self.client_order_id("SL", symbol)
         body = {

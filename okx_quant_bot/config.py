@@ -67,7 +67,7 @@ class Settings:
     max_consecutive_losses: int
     telegram_bot_token: str
     telegram_chat_id: str
-    scan_interval_seconds: int = 300
+    scan_interval_seconds: int = 30
     candidate_top_n: int = 20
     risk_per_trade_usdt: float = 200.0
     target_position_usdt: float = 1000.0
@@ -128,7 +128,7 @@ class Settings:
             max_consecutive_losses=_int("MAX_CONSECUTIVE_LOSSES", 3),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
-            scan_interval_seconds=_int("SCAN_INTERVAL_SECONDS", 300),
+            scan_interval_seconds=_int("SCAN_INTERVAL_SECONDS", 30),
             candidate_top_n=_int("CANDIDATE_TOP_N", 20),
             risk_per_trade_usdt=_float("RISK_PER_TRADE_USDT", 200.0),
             target_position_usdt=_float("TARGET_POSITION_USDT", 1000.0),

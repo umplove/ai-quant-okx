@@ -20,6 +20,22 @@ class Notifier:
     def send_money(self, message: str) -> None:
         self.send(message)
 
+    def setup_commands(self) -> None:
+        if not (self.settings.telegram_controls_enabled and self.settings.telegram_bot_token):
+            return
+        commands = [
+            {"command": "status", "description": "查看资金状态"},
+            {"command": "stop", "description": "停止所有交易"},
+            {"command": "start", "description": "恢复交易"},
+            {"command": "reset", "description": "重置资金统计"},
+        ]
+        token = self.settings.telegram_bot_token
+        url = f"https://api.telegram.org/bot{token}/setMyCommands"
+        body = urllib.parse.urlencode({"commands": json.dumps(commands, ensure_ascii=False)}).encode("utf-8")
+        request = urllib.request.Request(url, data=body, method="POST")
+        with urllib.request.urlopen(request, timeout=10) as response:
+            json.loads(response.read().decode("utf-8"))
+
     def poll_controls(self, storage) -> list[str]:
         if not (
             self.settings.telegram_controls_enabled
@@ -45,10 +61,12 @@ class Notifier:
             if text == "/stop":
                 storage.set_state("bot_paused", "1")
                 actions.append("stopped")
-            elif text in {"/start", "/restart"}:
+            elif text == "/start":
                 storage.set_state("bot_paused", "0")
+                actions.append("started")
+            elif text in {"/reset", "/restart"}:
                 storage.set_state("money_baseline_equity", "")
-                actions.append("restarted")
+                actions.append("reset")
             elif text == "/status":
                 actions.append("status")
         return actions

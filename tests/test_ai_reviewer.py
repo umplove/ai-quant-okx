@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from okx_quant_bot.ai_reviewer import AiReviewClient, _extract_ai_text, _extract_output_text
+from okx_quant_bot.ai_reviewer import AiReviewClient, _extract_ai_text, _extract_output_text, _parse_trade_decision
 from okx_quant_bot.models import CandidateScore, InfoSignal, MarketTicker
 from okx_quant_bot.momentum import MomentumScan
 from tests.test_strategy_risk import settings_for
@@ -146,7 +146,7 @@ class AiReviewerTests(unittest.TestCase):
             ]
         }
 
-        self.assertIn("允许规则策略", _extract_ai_text(payload))
+        self.assertIn('"action":"buy"', _extract_ai_text(payload))
 
     def test_timeout_is_short_error(self):
         def opener(request, timeout):
@@ -172,6 +172,12 @@ class AiReviewerTests(unittest.TestCase):
         payload = {"content": [{"type": "text", "text": "停止"}]}
 
         self.assertEqual(_extract_ai_text(payload), "停止")
+
+    def test_parse_trade_decision_json(self):
+        decision = _parse_trade_decision('{"action":"sell","confidence":0.8,"reason":"跌破风险线"}')
+
+        self.assertTrue(decision.approved_sell)
+        self.assertEqual(decision.reason, "跌破风险线")
 
 
 def _scan() -> MomentumScan:

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from okx_quant_bot.config import Settings
-from okx_quant_bot.models import CandidateScore, InfoSignal
+from okx_quant_bot.models import CandidateScore, InfoSignal, Position
 from okx_quant_bot.momentum import MomentumScan
 
 
@@ -16,6 +16,24 @@ class AiReview:
     ok: bool
     text: str
     error: str = ""
+
+
+@dataclass(frozen=True)
+class AiTradeDecision:
+    ok: bool
+    action: str = "hold"
+    confidence: float = 0.0
+    reason: str = ""
+    raw_text: str = ""
+    error: str = ""
+
+    @property
+    def approved_buy(self) -> bool:
+        return self.ok and self.action == "buy" and self.confidence >= 0.65
+
+    @property
+    def approved_sell(self) -> bool:
+        return self.ok and self.action == "sell" and self.confidence >= 0.65
 
 
 class AiReviewClient:
@@ -39,8 +57,41 @@ class AiReviewClient:
     ) -> AiReview:
         if not self.enabled:
             return AiReview(False, "", "AI review is disabled or OPENAI_API_KEY is missing.")
-
         prompt = _scan_prompt(self.settings, scan, open_position_count, strategy_memory)
+        result = self._complete(prompt)
+        if not result.ok:
+            return AiReview(False, "", result.error)
+        return AiReview(True, _telegram_sized(result.raw_text))
+
+    def decide_buy(
+        self,
+        scan: MomentumScan,
+        candidate: CandidateScore,
+        open_position_count: int,
+        strategy_memory: str = "",
+    ) -> AiTradeDecision:
+        prompt = _buy_prompt(self.settings, scan, candidate, open_position_count, strategy_memory)
+        return self._decide(prompt)
+
+    def decide_sell(
+        self,
+        scan: MomentumScan,
+        position: Position,
+        current_price: float,
+        strategy_memory: str = "",
+    ) -> AiTradeDecision:
+        prompt = _sell_prompt(self.settings, scan, position, current_price, strategy_memory)
+        return self._decide(prompt)
+
+    def _decide(self, prompt: str) -> AiTradeDecision:
+        result = self._complete(prompt)
+        if not result.ok:
+            return AiTradeDecision(False, error=result.error)
+        return _parse_trade_decision(result.raw_text)
+
+    def _complete(self, prompt: str) -> AiTradeDecision:
+        if not self.enabled:
+            return AiTradeDecision(False, error="AI is disabled or OPENAI_API_KEY is missing.")
         body = self._request_body(prompt)
         request = urllib.request.Request(
             self._request_url(),
@@ -48,23 +99,22 @@ class AiReviewClient:
             method="POST",
             headers=self._headers(),
         )
-
         try:
             raw = self._opener(request, self.settings.ai_review_timeout_seconds)
             payload = json.loads(raw.decode("utf-8"))
             text = _extract_ai_text(payload).strip()
             if not text:
-                return AiReview(False, "", "OpenAI response did not contain output text.")
-            return AiReview(True, _telegram_sized(text))
+                return AiTradeDecision(False, error="AI response did not contain output text.")
+            return AiTradeDecision(True, raw_text=text)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
-            return AiReview(False, "", f"OpenAI HTTP {exc.code}: {detail}")
+            return AiTradeDecision(False, error=f"OpenAI HTTP {exc.code}: {detail}")
         except TimeoutError:
-            return AiReview(False, "", "timeout")
+            return AiTradeDecision(False, error="timeout")
         except Exception as exc:
             if "timed out" in str(exc).lower():
-                return AiReview(False, "", "timeout")
-            return AiReview(False, "", f"OpenAI review failed: {exc}")
+                return AiTradeDecision(False, error="timeout")
+            return AiTradeDecision(False, error=f"OpenAI request failed: {exc}")
 
     def _request_url(self) -> str:
         if self.settings.openai_api_mode == "anthropic":
@@ -98,10 +148,7 @@ class AiReviewClient:
         }
 
     def _headers(self) -> dict[str, str]:
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "okx-quant-bot/0.1",
-        }
+        headers = {"Content-Type": "application/json", "User-Agent": "okx-quant-bot/0.1"}
         if self.settings.openai_api_mode == "anthropic":
             headers["x-api-key"] = self.settings.openai_api_key
             headers["anthropic-version"] = "2023-06-01"
@@ -112,9 +159,9 @@ class AiReviewClient:
 
 def _instructions() -> str:
     return (
-        "你是一个加密货币模拟盘资金复盘助手。只关心钱：权益、盈亏、风险敞口、是否应该继续让规则策略运行。"
-        "输出中文，必须先给最终结论，最多3句话。不要列候选币长名单，不要讲无关市场新闻。"
-        "不要要求扩大仓位，不要建议移除止损，不要声称一定盈利。"
+        "你是加密货币模拟盘交易风控助手。交易决策必须只输出 JSON，不要 Markdown。"
+        "JSON 格式: {\"action\":\"buy|hold|sell\",\"confidence\":0.0,\"reason\":\"一句中文原因\"}。"
+        "不要建议移除止损，不要扩大仓位，不要声称一定盈利。"
     )
 
 
@@ -125,32 +172,68 @@ def _scan_prompt(
     strategy_memory: str = "",
 ) -> str:
     candidates = scan.candidates[: settings.ai_review_max_candidates]
-    info_by_symbol = _group_info(scan.info_signals)
     lines = [
-        "请复盘本轮 OKX 现货动量扫描。",
-        f"模式: {'模拟盘' if settings.okx_demo else '实盘'}; "
-        f"真实下单: {'开启' if settings.trading_enabled else '关闭'}; "
-        f"当前持仓数: {open_position_count}/{settings.max_open_positions}",
-        f"单笔目标名义: {settings.target_position_usdt:.2f} USDT; "
-        f"单笔风险预算: {settings.risk_per_trade_usdt:.2f} USDT; "
-        f"止损模式: {settings.stop_mode}",
-        f"扫描行情数: {len(scan.tickers)}; 信息信号数: {len(scan.info_signals)}",
-        "有效策略记忆:",
+        "复盘本轮 OKX 现货动量扫描，只输出一句中文资金结论。",
+        f"模式: {'模拟盘' if settings.okx_demo else '实盘'}; 当前持仓: {open_position_count}/{settings.max_open_positions}",
+        f"单笔目标名义: {settings.target_position_usdt:.2f} USDT; 单笔风险预算: {settings.risk_per_trade_usdt:.2f} USDT",
+        "策略记忆:",
         strategy_memory or "- 暂无",
-        "候选币:",
+        "候选:",
     ]
-    if not candidates:
-        lines.append("- 无候选币")
+    info_by_symbol = _group_info(scan.info_signals)
     for candidate in candidates:
         lines.extend(_candidate_lines(candidate, info_by_symbol.get(candidate.symbol, [])))
-    lines.extend(
-        [
-            "请输出:",
-            "1. 资金风险结论",
-            "2. 是否允许规则策略按原风控继续运行",
-            "3. 如风险偏高，直接说停止",
-        ]
-    )
+    return "\n".join(lines)
+
+
+def _buy_prompt(
+    settings: Settings,
+    scan: MomentumScan,
+    candidate: CandidateScore,
+    open_position_count: int,
+    strategy_memory: str = "",
+) -> str:
+    info_by_symbol = _group_info(scan.info_signals)
+    lines = [
+        "判断是否允许买入这个候选币。只输出 JSON。",
+        f"候选: {candidate.symbol}",
+        f"价格: {candidate.price:.8g}",
+        f"24h涨幅: {candidate.change_pct_24h * 100:.2f}%",
+        f"24h振幅: {candidate.amplitude_pct_24h * 100:.2f}%",
+        f"成交额: {candidate.volume_quote_24h:.2f}",
+        f"规则得分: {candidate.total_score:.2f}",
+        f"规则原因: {candidate.reason}",
+        f"当前持仓: {open_position_count}/{settings.max_open_positions}",
+        f"单笔目标: {settings.target_position_usdt:.2f} USDT; 单笔风险: {settings.risk_per_trade_usdt:.2f} USDT",
+        "相关新闻和公开情报:",
+    ]
+    lines.extend(_signal_lines(info_by_symbol.get(candidate.symbol, []), limit=settings.intelligence_max_items))
+    lines.extend(["策略经验:", strategy_memory or "- 暂无"])
+    return "\n".join(lines)
+
+
+def _sell_prompt(
+    settings: Settings,
+    scan: MomentumScan,
+    position: Position,
+    current_price: float,
+    strategy_memory: str = "",
+) -> str:
+    pnl = (current_price - position.avg_entry_price) * position.base_qty
+    return_pct = 0.0 if position.avg_entry_price <= 0 else (current_price - position.avg_entry_price) / position.avg_entry_price * 100
+    info_by_symbol = _group_info(scan.info_signals)
+    lines = [
+        "判断当前持仓是否应该市价卖出。只输出 JSON。",
+        f"持仓: {position.symbol}",
+        f"成本: {position.avg_entry_price:.8g}",
+        f"现价: {current_price:.8g}",
+        f"数量: {position.base_qty:.8g}",
+        f"浮动盈亏: {pnl:+.2f} USDT",
+        f"收益率: {return_pct:+.2f}%",
+        "相关新闻和公开情报:",
+    ]
+    lines.extend(_signal_lines(info_by_symbol.get(position.symbol, []), limit=settings.intelligence_max_items))
+    lines.extend(["策略经验:", strategy_memory or "- 暂无"])
     return "\n".join(lines)
 
 
@@ -160,14 +243,18 @@ def _candidate_lines(candidate: CandidateScore, signals: list[InfoSignal]) -> li
             f"- {candidate.symbol}: price={candidate.price:.8g}, "
             f"24h_change={candidate.change_pct_24h * 100:.2f}%, "
             f"24h_amp={candidate.amplitude_pct_24h * 100:.2f}%, "
-            f"quote_vol={candidate.volume_quote_24h:.2f}, "
-            f"score={candidate.total_score:.2f}, "
+            f"quote_vol={candidate.volume_quote_24h:.2f}, score={candidate.total_score:.2f}, "
             f"confirmed={candidate.confirmed}, reason={candidate.reason}"
         )
     ]
-    for signal in signals[:3]:
-        lines.append(f"  info: [{signal.source}] score={signal.score:.2f} {signal.title}")
+    lines.extend(_signal_lines(signals, limit=5))
     return lines
+
+
+def _signal_lines(signals: list[InfoSignal], limit: int) -> list[str]:
+    if not signals:
+        return ["- 暂无"]
+    return [f"- [{s.source}] score={s.score:.2f} {s.title}" for s in signals[:limit]]
 
 
 def _group_info(signals: list[InfoSignal]) -> dict[str, list[InfoSignal]]:
@@ -175,6 +262,32 @@ def _group_info(signals: list[InfoSignal]) -> dict[str, list[InfoSignal]]:
     for signal in signals:
         grouped.setdefault(signal.symbol, []).append(signal)
     return grouped
+
+
+def _parse_trade_decision(text: str) -> AiTradeDecision:
+    raw_text = text
+    text = text.strip()
+    if "```" in text:
+        text = text.replace("```json", "```")
+        text = next((part.strip() for part in text.split("```") if "action" in part), text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        text = text[start : end + 1]
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return AiTradeDecision(False, raw_text=raw_text, error="AI decision JSON parse failed.")
+    action = str(payload.get("action") or "hold").strip().lower()
+    if action not in {"buy", "hold", "sell"}:
+        action = "hold"
+    try:
+        confidence = float(payload.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(confidence, 1.0))
+    reason = str(payload.get("reason") or "")[:500]
+    return AiTradeDecision(True, action, confidence, reason, raw_text)
 
 
 def _extract_ai_text(payload: dict) -> str:
@@ -218,10 +331,10 @@ def _extract_chat_text(payload: dict) -> str:
 def _summarize_reasoning_fallback(text: str) -> str:
     compact = " ".join(text.split())
     if any(word in compact for word in ("停止", "风险偏高", "不建议", "暂不")):
-        return "AI资金结论: 风险偏高，建议停止新交易。"
-    if any(word in compact for word in ("允许", "继续运行", "风险低", "风险可控")):
-        return "AI资金结论: 资金风险可控，允许规则策略按原风控继续运行。"
-    return "AI资金结论: 已收到模型推理，但未生成最终结论，建议继续观察。"
+        return '{"action":"hold","confidence":0.7,"reason":"模型推理认为风险偏高，暂不交易"}'
+    if any(word in compact for word in ("买入", "允许", "风险可控", "继续运行")):
+        return '{"action":"buy","confidence":0.7,"reason":"模型推理认为风险可控"}'
+    return '{"action":"hold","confidence":0.5,"reason":"模型只返回推理，未给出明确交易结论"}'
 
 
 def _extract_output_text(payload: dict) -> str:

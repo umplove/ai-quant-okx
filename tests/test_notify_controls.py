@@ -42,15 +42,41 @@ class NotifyControlsTests(unittest.TestCase):
                 "result": [
                     {"update_id": 10, "message": {"text": "/stop", "chat": {"id": 123}}},
                     {"update_id": 11, "message": {"text": "/start", "chat": {"id": 123}}},
-                    {"update_id": 12, "message": {"text": "/status", "chat": {"id": 123}}},
+                    {"update_id": 12, "message": {"text": "/reset", "chat": {"id": 123}}},
+                    {"update_id": 13, "message": {"text": "/status", "chat": {"id": 123}}},
                 ]
             }
             with patch("urllib.request.urlopen", return_value=_Response(payload)):
                 actions = Notifier(settings).poll_controls(storage)
 
-            self.assertEqual(actions, ["stopped", "restarted", "status"])
+            self.assertEqual(actions, ["stopped", "started", "reset", "status"])
             self.assertEqual(storage.get_state("bot_paused"), "0")
-            self.assertEqual(storage.get_state("telegram_update_offset"), "13")
+            self.assertEqual(storage.get_state("telegram_update_offset"), "14")
+
+    def test_setup_commands_registers_function_panel(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["body"] = request.data.decode("utf-8")
+            return _Response({"ok": True})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = settings_for(Path(tmp) / "bot.sqlite3")
+            settings = settings.__class__(
+                **{
+                    **settings.__dict__,
+                    "telegram_bot_token": "token",
+                    "telegram_chat_id": "123",
+                    "telegram_controls_enabled": True,
+                }
+            )
+            with patch("urllib.request.urlopen", fake_urlopen):
+                Notifier(settings).setup_commands()
+
+        self.assertIn("/bot", captured["url"])
+        for command in ("status", "stop", "start", "reset"):
+            self.assertIn(command, captured["body"])
 
 
 if __name__ == "__main__":

@@ -11,7 +11,6 @@ from okx_quant_bot.models import CandidateScore, OrderResult, Position, Side, St
 from okx_quant_bot.momentum import MomentumScan, run_momentum_scan, stop_loss_plan, target_position_usdt, utc_day
 from okx_quant_bot.notify import Notifier
 from okx_quant_bot.risk import RiskManager
-from okx_quant_bot.runner import _order_failed_message, _order_recorded_message
 from okx_quant_bot.trade_review import TradeReviewEngine
 
 
@@ -25,26 +24,19 @@ class MomentumBotRunner:
     def run_forever(self) -> None:
         self.settings.require_safe_trading_config()
         self.storage.init()
-        if self.settings.telegram_money_only:
-            self._send_money_report(note="启动")
-        else:
-            self.notifier.send(_momentum_start_message(self.settings.okx_demo, self.settings.trading_enabled))
-            if not self.settings.binance_square_enabled:
-                self.notifier.send("币安广场读取接口未启用，本轮试运行不把广场数据作为买入条件。")
+        try:
+            self.notifier.setup_commands()
+        except Exception:
+            pass
+        self._send_money_report()
 
         while True:
             try:
                 self._handle_controls()
-                if self._is_paused():
-                    self._send_money_report(note="已停止开新仓")
-                    time.sleep(self.settings.scan_interval_seconds)
-                    continue
-                self.run_once()
-            except Exception as exc:
-                if self.settings.telegram_money_only:
-                    self._send_money_report(note=f"异常: {exc}")
-                else:
-                    self.notifier.send(f"信息面动量机器人异常暂停一轮：{exc}")
+                if not self._is_paused():
+                    self.run_once()
+            except Exception:
+                self._send_money_report()
             time.sleep(self.settings.scan_interval_seconds)
 
     def run_once(self) -> MomentumScan:
@@ -57,97 +49,134 @@ class MomentumBotRunner:
         self.storage.save_candidate_scores(scan.candidates)
         self._review_open_trades(scan)
 
-        if self.settings.telegram_money_only:
-            ai_note = self._ai_review_text(scan)
-            self._send_money_report(scan=scan, ai_note=ai_note)
-        else:
-            self._send_scan_summary(scan)
-            self._send_daily_report(scan)
-            self._send_ai_review(scan)
-
+        self._sell_positions_with_ai(scan)
         for candidate in self._tradable_candidates(scan):
             if self.storage.open_position_count() >= self.settings.max_open_positions:
                 break
-            self._buy_and_protect(candidate)
+            decision = self._ai_buy_decision(scan, candidate)
+            if decision.approved_buy:
+                self._buy_and_protect(candidate)
+
+        self._send_money_report(scan=scan)
         return scan
 
     def _tradable_candidates(self, scan: MomentumScan) -> list[CandidateScore]:
         candidates: list[CandidateScore] = []
-        if not scan.candidates:
-            if not self.settings.telegram_money_only:
-                self.notifier.send("本轮没有找到符合条件的 USDT 现货候选币。")
-            return candidates
         for candidate in scan.candidates:
             if self.storage.open_position_count() + len(candidates) >= self.settings.max_open_positions:
                 break
-            if not self._is_tradable_candidate(candidate):
-                continue
-            candidates.append(candidate)
+            if self._is_tradable_candidate(candidate):
+                candidates.append(candidate)
         return candidates
 
     def _is_tradable_candidate(self, candidate: CandidateScore) -> bool:
+        if candidate.symbol not in set(self.settings.symbols):
+            return False
         if not candidate.confirmed:
-            if not self.settings.telegram_money_only:
-                self.notifier.send(f"{candidate.symbol} 未通过确认，暂不买入。{candidate.reason}")
             return False
         if self.storage.open_position_count() >= self.settings.max_open_positions:
-            if not self.settings.telegram_money_only:
-                self.notifier.send(
-                    f"已有持仓数量达到上限 {self.settings.max_open_positions}，本轮不新增仓位。"
-                )
             return False
         if self.storage.get_position(candidate.symbol).is_open:
-            if not self.settings.telegram_money_only:
-                self.notifier.send(f"{candidate.symbol} 已有持仓，本轮不重复买入。")
             return False
         return True
 
+    def _ai_buy_decision(self, scan: MomentumScan, candidate: CandidateScore):
+        client = AiReviewClient(self.settings)
+        decision = client.decide_buy(scan, candidate, self.storage.open_position_count(), self._strategy_context())
+        self._record_ai_decision(candidate.symbol, "buy", decision)
+        return decision
+
+    def _ai_sell_decision(self, scan: MomentumScan, position: Position, current_price: float):
+        client = AiReviewClient(self.settings)
+        decision = client.decide_sell(scan, position, current_price, self._strategy_context())
+        self._record_ai_decision(position.symbol, "sell", decision)
+        return decision
+
+    def _record_ai_decision(self, symbol: str, intent: str, decision) -> None:
+        self.storage.save_ai_decision(
+            symbol,
+            intent,
+            decision.action if decision.ok else "hold",
+            float(decision.confidence),
+            decision.reason if decision.ok else decision.error,
+            decision.raw_text,
+        )
+
+    def _strategy_context(self) -> str:
+        parts = [
+            "\n".join(self.storage.active_strategy_lessons()),
+            "\n".join(self.storage.recent_trade_reviews()),
+            "\n".join(self.storage.recent_intelligence(self.settings.intelligence_max_items)),
+            "\n".join(self.storage.recent_ai_decisions()),
+        ]
+        return "\n".join(part for part in parts if part)
+
     def _buy_and_protect(self, candidate: CandidateScore) -> None:
         quote_amount = target_position_usdt(self.settings)
-        plan = stop_loss_plan(self.settings, candidate.symbol, candidate.price, quote_amount)
-        reason = f"momentum_ai:{candidate.reason}"
-
         if not self.settings.trading_enabled:
             request, result = self._dry_run_buy(candidate, quote_amount)
         else:
-            request, result = self.exchange.place_market_buy_quote(candidate.symbol, quote_amount, reason)
+            request, result = self.exchange.place_market_buy_quote(
+                candidate.symbol,
+                quote_amount,
+                f"ai_buy:{candidate.reason}",
+            )
         self.storage.save_order(request, result)
         if not result.ok:
-            RiskManager(self.settings, self.storage).pause_symbol(candidate.symbol, f"order_failed:{result.error}")
-            if self.settings.telegram_money_only:
-                self._send_money_report(note=f"下单失败: {candidate.symbol} {result.error}")
-            else:
-                self.notifier.send(_order_failed_message(candidate.symbol, result.error))
+            self.storage.save_strategy_lesson(
+                candidate.symbol,
+                0.0,
+                0.0,
+                f"order_failed:{result.error or 'unknown'}",
+                str(result.raw),
+            )
             return
 
         fill_price = _filled_price(result) or candidate.price
         fill_size = _filled_size(result) or (quote_amount / fill_price if fill_price > 0 else 0.0)
         plan = stop_loss_plan(self.settings, candidate.symbol, fill_price, fill_size * fill_price)
-        self.storage.save_position(
-            Position(
-                symbol=candidate.symbol,
-                base_qty=fill_size,
-                avg_entry_price=fill_price,
-                highest_price=fill_price,
-            )
-        )
-        if not self.settings.telegram_money_only:
-            self.notifier.send(_momentum_buy_message(candidate, quote_amount, fill_price, plan.stop_price))
-            self.notifier.send(_order_recorded_message(candidate.symbol, Side.BUY, candidate.reason))
-
+        self.storage.save_position(Position(candidate.symbol, fill_size, fill_price, fill_price))
         stop_order = self._place_stop_loss(plan)
         self.storage.save_stop_loss_order(stop_order)
-        if stop_order.ok:
-            if self.settings.telegram_money_only:
-                self._send_money_report(note=f"已买入 {candidate.symbol}，止损已挂")
-            else:
-                self.notifier.send(_stop_loss_ok_message(stop_order, plan.risk_usdt))
-        else:
+        if not stop_order.ok:
             RiskManager(self.settings, self.storage).pause_symbol(candidate.symbol, f"stop_loss_failed:{stop_order.error}")
-            if self.settings.telegram_money_only:
-                self._send_money_report(note=f"止损失败: {candidate.symbol} {stop_order.error}")
-            else:
-                self.notifier.send(_stop_loss_failed_message(stop_order))
+
+    def _sell_positions_with_ai(self, scan: MomentumScan) -> None:
+        prices = {ticker.symbol: ticker.last for ticker in scan.tickers}
+        for position in self.storage.open_positions():
+            price = prices.get(position.symbol)
+            if price is None:
+                continue
+            decision = self._ai_sell_decision(scan, position, price)
+            if decision.approved_sell:
+                self._sell_position(position, price, decision.reason)
+
+    def _sell_position(self, position: Position, current_price: float, reason: str) -> None:
+        if not self.settings.trading_enabled:
+            request, result = self._dry_run_sell(position, reason)
+        else:
+            request, result = self.exchange.place_market_sell_base(
+                position.symbol,
+                position.base_qty,
+                f"ai_sell:{reason}",
+            )
+        self.storage.save_order(request, result)
+        if not result.ok:
+            self.storage.save_strategy_lesson(
+                position.symbol,
+                0.0,
+                0.0,
+                f"sell_failed:{result.error or 'unknown'}",
+                str(result.raw),
+            )
+            return
+        pnl = (current_price - position.avg_entry_price) * position.base_qty
+        return_pct = 0.0 if position.avg_entry_price <= 0 else (
+            (current_price - position.avg_entry_price) / position.avg_entry_price * 100.0
+        )
+        self.storage.save_position(Position(symbol=position.symbol))
+        RiskManager(self.settings, self.storage).record_trade_pnl(pnl)
+        self.storage.save_strategy_lesson(position.symbol, pnl, return_pct, f"ai_sell:{reason}", str(result.raw))
 
     def _dry_run_buy(self, candidate: CandidateScore, quote_amount: float):
         from okx_quant_bot.models import OrderRequest
@@ -159,7 +188,7 @@ class MomentumBotRunner:
             order_type="market",
             price=None,
             client_order_id=OkxRestClient.client_order_id("DRYB", candidate.symbol),
-            reason=f"momentum_ai:{candidate.reason}",
+            reason=f"ai_buy:{candidate.reason}",
             target_currency="quote_ccy",
         )
         result = OrderResult(
@@ -169,6 +198,28 @@ class MomentumBotRunner:
             order_id="dry-run",
             client_order_id=request.client_order_id,
             raw={"dry_run": True, "avgPx": candidate.price, "accFillSz": quote_amount / candidate.price},
+        )
+        return request, result
+
+    def _dry_run_sell(self, position: Position, reason: str):
+        from okx_quant_bot.models import OrderRequest
+
+        request = OrderRequest(
+            symbol=position.symbol,
+            side=Side.SELL,
+            size=position.base_qty,
+            order_type="market",
+            price=None,
+            client_order_id=OkxRestClient.client_order_id("DRYS", position.symbol),
+            reason=f"ai_sell:{reason}",
+        )
+        result = OrderResult(
+            ok=True,
+            symbol=position.symbol,
+            side=Side.SELL,
+            order_id="dry-run",
+            client_order_id=request.client_order_id,
+            raw={"dry_run": True},
         )
         return request, result
 
@@ -185,65 +236,22 @@ class MomentumBotRunner:
             )
         return self.exchange.place_stop_loss_order(plan.symbol, plan.size, plan.stop_price)
 
-    def _send_scan_summary(self, scan: MomentumScan) -> None:
-        if not scan.candidates:
-            return
-        top = scan.candidates[:3]
-        lines = ["本轮信息面动量候选："]
-        for idx, candidate in enumerate(top, start=1):
-            marker = "可交易" if candidate.confirmed else "待确认"
-            lines.append(
-                f"{idx}. {candidate.symbol} {marker} 分数{candidate.total_score:.2f} "
-                f"涨幅{candidate.change_pct_24h * 100:.2f}% 振幅{candidate.amplitude_pct_24h * 100:.2f}%"
-            )
-        self.notifier.send("\n".join(lines))
-
-    def _send_daily_report(self, scan: MomentumScan) -> None:
-        today = utc_day()
-        state_key = f"daily_report:{today}"
-        if self.storage.get_state(state_key):
-            return
-        best = scan.best.symbol if scan.best else "无"
-        summary = (
-            f"{today} 信息面动量日报：扫描{len(scan.tickers)}个交易对，"
-            f"信息信号{len(scan.info_signals)}条，最高候选{best}，"
-            f"当前持仓{self.storage.open_position_count()}个。"
-        )
-        self.storage.save_daily_report(today, summary)
-        self.storage.set_state(state_key, "sent")
-        self.notifier.send(summary)
-
-    def _send_ai_review(self, scan: MomentumScan) -> None:
-        text = self._ai_review_text(scan)
-        if text:
-            self.notifier.send("AI复盘：\n" + text)
-
     def _ai_review_text(self, scan: MomentumScan) -> str:
         if not self.settings.ai_review_enabled:
             return ""
-        count = int(self.storage.get_state("ai_review_scan_count", "0") or "0") + 1
-        self.storage.set_state("ai_review_scan_count", str(count))
-        if count % self.settings.ai_review_interval_scans != 0:
-            return ""
-        memory = "\n".join(self.storage.active_strategy_lessons())
-        reviews = "\n".join(self.storage.recent_trade_reviews())
-        intel = "\n".join(self.storage.recent_intelligence())
-        context = "\n".join(part for part in (memory, reviews, intel) if part)
-        review = AiReviewClient(self.settings).review_scan(scan, self.storage.open_position_count(), context)
+        review = AiReviewClient(self.settings).review_scan(
+            scan,
+            self.storage.open_position_count(),
+            self._strategy_context(),
+        )
         if review.ok:
             return review.text
-        if review.error == "timeout":
-            return ""
-        return f"AI unavailable: {review.error}"
+        return "" if review.error == "timeout" else f"AI unavailable: {review.error}"
 
     def _review_open_trades(self, scan: MomentumScan) -> None:
         if not self.settings.trade_review_enabled:
             return
-        reviews = TradeReviewEngine().mark_to_market(
-            self.storage.open_positions(),
-            scan.tickers,
-            note="auto review",
-        )
+        reviews = TradeReviewEngine().mark_to_market(self.storage.open_positions(), scan.tickers, note="auto review")
         for review in reviews:
             self.storage.save_trade_review(review)
             self.storage.save_strategy_lesson(
@@ -265,19 +273,15 @@ class MomentumBotRunner:
         if scan is not None and count % self.settings.money_report_interval_scans != 0:
             return
         snapshot = self._money_snapshot()
-        lines = [
-            f"资金状态: {snapshot['status']}",
-            f"当前权益: {snapshot['equity']:.2f} USDT",
-            f"累计盈亏: {snapshot['pnl']:+.2f} USDT",
-            f"盈亏比: {snapshot['return_pct']:+.2f}%",
-            f"持仓: {self.storage.open_position_count()}/{self.settings.max_open_positions}",
-            f"模式: {'模拟盘自动下单' if self.settings.trading_enabled else '只记录不下单'}",
-        ]
-        if note:
-            lines.append(f"备注: {note}")
-        if ai_note:
-            lines.append("AI资金结论: " + _one_line(ai_note))
-        message = "\n".join(lines)
+        message = "\n".join(
+            [
+                f"总资产: {snapshot['equity']:.2f} USDT",
+                f"今日盈亏: {snapshot['daily_pnl']:+.2f} USDT",
+                f"累计盈亏: {snapshot['pnl']:+.2f} USDT",
+                f"当前持仓: {self.storage.open_position_count()}/{self.settings.max_open_positions}",
+                f"盈亏比: {snapshot['return_pct']:+.2f}%",
+            ]
+        )
         self.notifier.send_money(message)
         if scan is not None:
             best = scan.best.symbol if scan.best else "NONE"
@@ -285,11 +289,11 @@ class MomentumBotRunner:
                 symbol=best,
                 pnl_usdt=float(snapshot["pnl"]),
                 return_pct=float(snapshot["return_pct"]),
-                summary=_one_line(ai_note or note or "资金快照"),
+                summary="资金快照",
                 raw=message,
             )
 
-    def _money_snapshot(self) -> dict[str, float | str]:
+    def _money_snapshot(self) -> dict[str, float]:
         equity = self._account_equity()
         baseline_raw = self.storage.get_state("money_baseline_equity", "")
         if not baseline_raw:
@@ -297,15 +301,17 @@ class MomentumBotRunner:
             baseline = equity
         else:
             baseline = float(baseline_raw)
-        pnl = equity - baseline
-        return_pct = 0.0 if baseline <= 0 else pnl / baseline * 100.0
-        if pnl > 0:
-            status = "赚了"
-        elif pnl < 0:
-            status = "亏了"
+        daily_key = f"money_daily_baseline:{utc_day()}"
+        daily_raw = self.storage.get_state(daily_key, "")
+        if not daily_raw:
+            self.storage.set_state(daily_key, str(equity))
+            daily_baseline = equity
         else:
-            status = "持平"
-        return {"equity": equity, "baseline": baseline, "pnl": pnl, "return_pct": return_pct, "status": status}
+            daily_baseline = float(daily_raw)
+        pnl = equity - baseline
+        daily_pnl = equity - daily_baseline
+        return_pct = 0.0 if baseline <= 0 else pnl / baseline * 100.0
+        return {"equity": equity, "daily_pnl": daily_pnl, "pnl": pnl, "return_pct": return_pct}
 
     def _account_equity(self) -> float:
         if not self.settings.trading_enabled:
@@ -321,44 +327,11 @@ class MomentumBotRunner:
 
     def _handle_controls(self) -> None:
         for action in self.notifier.poll_controls(self.storage):
-            if action == "stopped":
-                self._send_money_report(note="/stop 已停止所有新交易")
-            elif action == "restarted":
-                self._send_money_report(note="/start 已重新开始整盘统计")
-            elif action == "status":
-                self._send_money_report(note="/status")
+            if action in {"stopped", "started", "reset", "status"}:
+                self._send_money_report()
 
     def _is_paused(self) -> bool:
         return self.storage.get_state("bot_paused", "0") == "1"
-
-
-def _momentum_start_message(okx_demo: bool, trading_enabled: bool) -> str:
-    mode = "模拟盘" if okx_demo else "实盘"
-    trade = "会自动下单" if trading_enabled else "只记录模拟动作，不会发真实订单"
-    return f"OKX信息面动量机器人已启动（{mode}模式，{trade}）。"
-
-
-def _momentum_buy_message(
-    candidate: CandidateScore,
-    quote_amount: float,
-    fill_price: float,
-    stop_price: float,
-) -> str:
-    return (
-        f"{candidate.symbol} 已按信息面动量买入，名义金额约{quote_amount:.2f} USDT，"
-        f"成交参考价{fill_price:.8g}，保护止损价{stop_price:.8g}。"
-    )
-
-
-def _stop_loss_ok_message(order: StopLossOrder, risk_usdt: float) -> str:
-    return (
-        f"{order.symbol} 保护止损已挂好：触发价{order.stop_price:.8g}，"
-        f"数量{order.size:.8g}，计划风险约{risk_usdt:.2f} USDT。"
-    )
-
-
-def _stop_loss_failed_message(order: StopLossOrder) -> str:
-    return f"{order.symbol} 保护止损挂单失败，交易对已暂停：{order.error or '未知错误'}"
 
 
 def _filled_price(result: OrderResult) -> float | None:
@@ -381,8 +354,3 @@ def _filled_size(result: OrderResult) -> float | None:
             return float(value)
     value = result.raw.get("accFillSz")
     return float(value) if value not in {None, ""} else None
-
-
-def _one_line(text: str, limit: int = 180) -> str:
-    compact = " ".join(text.split())
-    return compact if len(compact) <= limit else compact[: limit - 3] + "..."

@@ -25,7 +25,11 @@ class _FakeExchange:
 class MomentumTests(unittest.TestCase):
     def test_market_scanner_uses_gainers_then_largest_amplitude(self):
         with tempfile.TemporaryDirectory() as tmp:
-            settings = _with(settings_for(Path(tmp) / "bot.sqlite3"), candidate_top_n=2)
+            settings = _with(
+                settings_for(Path(tmp) / "bot.sqlite3"),
+                candidate_top_n=2,
+                symbols=("AAA-USDT", "BBB-USDT", "CCC-USDT"),
+            )
             tickers = [
                 MarketTicker("AAA-USDT", 150, 100, 160, 140, 1000000, 1),
                 MarketTicker("BBB-USDT", 140, 100, 170, 90, 900000, 1),
@@ -36,6 +40,18 @@ class MomentumTests(unittest.TestCase):
             ranked = MarketScanner(_FakeExchange(tickers), settings).top_momentum_tickers()
 
         self.assertEqual([ticker.symbol for ticker in ranked], ["BBB-USDT", "AAA-USDT"])
+
+    def test_market_scanner_only_uses_configured_symbols(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _with(settings_for(Path(tmp) / "bot.sqlite3"), symbols=("BTC-USDT",))
+            tickers = [
+                MarketTicker("BTC-USDT", 120, 100, 130, 90, 1000000, 1),
+                MarketTicker("SAHARA-USDT", 120, 100, 130, 90, 1000000, 1),
+            ]
+
+            ranked = MarketScanner(_FakeExchange(tickers), settings).top_momentum_tickers()
+
+        self.assertEqual([ticker.symbol for ticker in ranked], ["BTC-USDT"])
 
     def test_candidate_can_trade_without_info_confirmation(self):
         ticker = MarketTicker("BTC-USDT", 120, 100, 130, 95, 10_000_000, 1)

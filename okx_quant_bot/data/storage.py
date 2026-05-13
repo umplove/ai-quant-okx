@@ -188,6 +188,17 @@ class Storage:
                     raw text not null,
                     created_at text default current_timestamp
                 );
+
+                create table if not exists ai_decisions (
+                    id integer primary key autoincrement,
+                    symbol text not null,
+                    intent text not null,
+                    action text not null,
+                    confidence real not null,
+                    reason text not null,
+                    raw text not null,
+                    created_at text default current_timestamp
+                );
                 """
             )
 
@@ -506,5 +517,39 @@ class Storage:
         return [
             f"{r['symbol']} {r['phase']} pnl={r['pnl_usdt']:+.2f}USDT "
             f"return={r['return_pct']:+.2f}%: {r['summary']}"
+            for r in rows
+        ]
+
+    def save_ai_decision(
+        self,
+        symbol: str,
+        intent: str,
+        action: str,
+        confidence: float,
+        reason: str,
+        raw: str = "",
+    ) -> None:
+        with self.session() as conn:
+            conn.execute(
+                """
+                insert into ai_decisions(symbol, intent, action, confidence, reason, raw)
+                values (?, ?, ?, ?, ?, ?)
+                """,
+                (symbol, intent, action, confidence, reason[:1000], raw[:4000]),
+            )
+
+    def recent_ai_decisions(self, limit: int = 12) -> list[str]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select symbol, intent, action, confidence, reason
+                from ai_decisions
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            f"{r['symbol']} {r['intent']} -> {r['action']} conf={r['confidence']:.2f}: {r['reason']}"
             for r in rows
         ]
