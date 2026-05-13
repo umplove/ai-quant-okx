@@ -50,7 +50,7 @@ class AiReviewClient:
         )
 
         try:
-            raw = self._opener(request, 30.0)
+            raw = self._opener(request, self.settings.ai_review_timeout_seconds)
             payload = json.loads(raw.decode("utf-8"))
             text = _extract_ai_text(payload).strip()
             if not text:
@@ -59,7 +59,11 @@ class AiReviewClient:
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
             return AiReview(False, "", f"OpenAI HTTP {exc.code}: {detail}")
+        except TimeoutError:
+            return AiReview(False, "", "timeout")
         except Exception as exc:
+            if "timed out" in str(exc).lower():
+                return AiReview(False, "", "timeout")
             return AiReview(False, "", f"OpenAI review failed: {exc}")
 
     def _request_url(self) -> str:

@@ -65,33 +65,42 @@ class MomentumBotRunner:
             self._send_daily_report(scan)
             self._send_ai_review(scan)
 
-        candidate = self._tradable_candidate(scan)
-        if candidate is None:
-            return scan
-        self._buy_and_protect(candidate)
+        for candidate in self._tradable_candidates(scan):
+            if self.storage.open_position_count() >= self.settings.max_open_positions:
+                break
+            self._buy_and_protect(candidate)
         return scan
 
-    def _tradable_candidate(self, scan: MomentumScan) -> CandidateScore | None:
-        best = scan.best
-        if best is None:
+    def _tradable_candidates(self, scan: MomentumScan) -> list[CandidateScore]:
+        candidates: list[CandidateScore] = []
+        if not scan.candidates:
             if not self.settings.telegram_money_only:
                 self.notifier.send("本轮没有找到符合条件的 USDT 现货候选币。")
-            return None
-        if not best.confirmed:
+            return candidates
+        for candidate in scan.candidates:
+            if self.storage.open_position_count() + len(candidates) >= self.settings.max_open_positions:
+                break
+            if not self._is_tradable_candidate(candidate):
+                continue
+            candidates.append(candidate)
+        return candidates
+
+    def _is_tradable_candidate(self, candidate: CandidateScore) -> bool:
+        if not candidate.confirmed:
             if not self.settings.telegram_money_only:
-                self.notifier.send(f"本轮最高候选 {best.symbol} 未通过确认，暂不买入。{best.reason}")
-            return None
+                self.notifier.send(f"{candidate.symbol} 未通过确认，暂不买入。{candidate.reason}")
+            return False
         if self.storage.open_position_count() >= self.settings.max_open_positions:
             if not self.settings.telegram_money_only:
                 self.notifier.send(
                     f"已有持仓数量达到上限 {self.settings.max_open_positions}，本轮不新增仓位。"
                 )
-            return None
-        if self.storage.get_position(best.symbol).is_open:
+            return False
+        if self.storage.get_position(candidate.symbol).is_open:
             if not self.settings.telegram_money_only:
-                self.notifier.send(f"{best.symbol} 已有持仓，本轮不重复买入。")
-            return None
-        return best
+                self.notifier.send(f"{candidate.symbol} 已有持仓，本轮不重复买入。")
+            return False
+        return True
 
     def _buy_and_protect(self, candidate: CandidateScore) -> None:
         quote_amount = target_position_usdt(self.settings)
@@ -221,7 +230,11 @@ class MomentumBotRunner:
         intel = "\n".join(self.storage.recent_intelligence())
         context = "\n".join(part for part in (memory, reviews, intel) if part)
         review = AiReviewClient(self.settings).review_scan(scan, self.storage.open_position_count(), context)
-        return review.text if review.ok else f"AI unavailable: {review.error}"
+        if review.ok:
+            return review.text
+        if review.error == "timeout":
+            return ""
+        return f"AI unavailable: {review.error}"
 
     def _review_open_trades(self, scan: MomentumScan) -> None:
         if not self.settings.trade_review_enabled:

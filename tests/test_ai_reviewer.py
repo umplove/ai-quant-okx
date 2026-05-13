@@ -148,6 +148,26 @@ class AiReviewerTests(unittest.TestCase):
 
         self.assertIn("允许规则策略", _extract_ai_text(payload))
 
+    def test_timeout_is_short_error(self):
+        def opener(request, timeout):
+            self.assertEqual(timeout, 3.0)
+            raise TimeoutError()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = settings_for(Path(tmp) / "bot.sqlite3")
+            settings = settings.__class__(
+                **{
+                    **settings.__dict__,
+                    "ai_review_enabled": True,
+                    "openai_api_key": "secret-key",
+                    "ai_review_timeout_seconds": 3.0,
+                }
+            )
+            review = AiReviewClient(settings, opener=opener).review_scan(_scan(), 0)
+
+        self.assertFalse(review.ok)
+        self.assertEqual(review.error, "timeout")
+
     def test_extracts_anthropic_text(self):
         payload = {"content": [{"type": "text", "text": "停止"}]}
 
