@@ -4,7 +4,7 @@ from pathlib import Path
 
 from okx_quant_bot.backtest import run_backtest
 from okx_quant_bot.data import Storage
-from okx_quant_bot.models import Candle, IntelligenceItem, Position, TradeReview
+from okx_quant_bot.models import Candle, IntelligenceItem, OrderRequest, OrderResult, Position, Side, TradeReview
 from okx_quant_bot.strategy import TrendPullbackStrategy
 
 
@@ -118,6 +118,29 @@ class BacktestStorageTests(unittest.TestCase):
         self.assertIn("split_limit", execution[0])
         self.assertIn("震荡", regimes[0])
         self.assertIn("追高", attributions[0])
+
+    def test_execution_summary_separates_ai_rules_and_okx_orders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "bot.sqlite3")
+            storage.init()
+            storage.save_execution_decision(
+                "BTC-USDT", "buy", "buy", "market_now", "hold", "normal", "fixed", "none", 0.8, "AI允许"
+            )
+            storage.save_execution_event(
+                "BTC-USDT", "SPOT", "long", "buy", "entry_decision", "approved", "rules_decision", reason="规则合成"
+            )
+            request = OrderRequest("BTC-USDT", Side.BUY, 100, "market", None, "CL1", "ai_buy:test")
+            storage.save_order(
+                request,
+                OrderResult(True, "BTC-USDT", Side.BUY, "OKX1", "CL1", {"data": [{"ordId": "OKX1", "state": "filled"}]}),
+            )
+
+            summary = storage.execution_summary()
+
+        self.assertIn("AI决策 buy/sell=1/0", summary)
+        self.assertIn("规则合成 buy/sell=1/0", summary)
+        self.assertIn("OKX真实订单 buy/sell=1/0", summary)
+        self.assertIn("filled=1", summary)
 
 
 if __name__ == "__main__":

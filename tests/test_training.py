@@ -53,8 +53,10 @@ class TrainingPoolTests(unittest.TestCase):
                 pool.stop()
 
             self.assertIn("120", storage.training_summary(current_week_key(), settings.ai_weekly_token_target))
+            self.assertIn("经验入库=1/1", storage.training_summary(current_week_key(), settings.ai_weekly_token_target))
             self.assertFalse(storage.recent_shadow_decisions())
             self.assertIn("portfolio_training", storage.recent_ai_call_breakdown())
+            self.assertIn("portfolio_training", storage.recent_real_experiences()[0])
 
     def test_worker_exception_is_recorded_and_thread_continues(self):
         with tempfile.TemporaryDirectory() as tmp:

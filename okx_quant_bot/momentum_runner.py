@@ -32,6 +32,7 @@ class MomentumBotRunner:
     def run_forever(self) -> None:
         self.settings.require_safe_trading_config()
         self.storage.init()
+        self._mark_runtime_started()
         self._save_config_snapshot()
         self.notifier.setup_commands()
         if self.training_pool is None:
@@ -54,6 +55,7 @@ class MomentumBotRunner:
         self._exited_symbols = set()
         self.settings.require_safe_trading_config()
         self.storage.init()
+        self._ensure_runtime_started()
         scan = self._apply_experience_bias(run_momentum_scan(self.settings, self.exchange))
         self.storage.save_market_snapshots(scan.tickers)
         self.storage.save_info_signals(scan.info_signals)
@@ -177,6 +179,27 @@ class MomentumBotRunner:
             return decision
         if decision and self._ai_vetoes_entry(decision):
             self.storage.save_strategy_lesson(candidate.symbol, 0.0, 0.0, f"ai_veto_buy:{decision.get('reason') or ''}", "")
+            self.storage.save_execution_event(
+                candidate.symbol,
+                "SPOT",
+                "long",
+                "buy",
+                "entry_decision",
+                "blocked",
+                "ai_risk_veto",
+                reason=str(decision.get("reason") or ""),
+            )
+            self.storage.save_real_experience(
+                candidate.symbol,
+                "SPOT",
+                "long",
+                self._current_market_regime(),
+                "buy",
+                "risk_rejected",
+                confidence=float(decision.get("confidence") or 0.0),
+                reason=str(decision.get("reason") or ""),
+                source="ai_risk_veto",
+            )
             return None
         if decision and str(decision.get("action") or "") == "buy":
             return decision
@@ -297,10 +320,42 @@ class MomentumBotRunner:
 
     def _ai_market_regime_decision(self, scan: MomentumScan) -> None:
         regime = AiReviewClient(self.settings).decide_market_regime(scan, self._strategy_context())
-        if regime.ok:
+        regime_ok = getattr(regime, "ok", False) is True
+        if regime_ok:
             self.storage.save_market_regime(regime.regime, regime.confidence, regime.reason, regime.raw_text)
         else:
-            self.storage.save_bot_error("market_regime", "AI行情状态判断失败", regime.error)
+            error = getattr(regime, "error", "") if isinstance(getattr(regime, "error", ""), str) else "invalid market regime response"
+            raw_text = getattr(regime, "raw_text", "") if isinstance(getattr(regime, "raw_text", ""), str) else ""
+            self.storage.save_bot_error("market_regime", "AI行情状态判断失败", error)
+            self.storage.save_real_experience(
+                "MARKET",
+                "SPOT",
+                "long",
+                "",
+                "market_regime",
+                "json_failed" if "parse_failed" in error else "failed",
+                confidence=0.0,
+                reason=error,
+                source="market_regime",
+                raw=raw_text,
+            )
+        self.storage.save_ai_call_audit(
+            symbol="MARKET",
+            intent="market_regime",
+            ok=regime_ok,
+            action="hold",
+            confidence=float(getattr(regime, "confidence", 0.0) if isinstance(getattr(regime, "confidence", 0.0), (int, float)) else 0.0),
+            prompt_chars=_int_attr(regime, "prompt_chars"),
+            response_chars=_int_attr(regime, "response_chars"),
+            duration_ms=_int_attr(regime, "duration_ms"),
+            error="" if regime_ok else error,
+            reason=regime.reason if regime_ok else error,
+            prompt_tokens=_int_attr(regime, "prompt_tokens"),
+            completion_tokens=_int_attr(regime, "completion_tokens"),
+            total_tokens=_int_attr(regime, "total_tokens"),
+            attempted_tokens=_int_attr(regime, "attempted_tokens"),
+            retry_count=_int_attr(regime, "retry_count"),
+        )
 
     def _record_ai_decision(self, symbol: str, intent: str, decision) -> None:
         action = decision.action if decision.ok else "hold"
@@ -342,9 +397,23 @@ class MomentumBotRunner:
             attempted_tokens=int(getattr(decision, "attempted_tokens", 0)),
             retry_count=int(getattr(decision, "retry_count", 0)),
         )
+        if not decision.ok and "parse_failed" in str(decision.error):
+            self.storage.save_real_experience(
+                symbol,
+                "SPOT",
+                "long",
+                self._current_market_regime(),
+                intent,
+                "json_failed",
+                confidence=0.0,
+                reason=decision.error,
+                source=f"{intent}_parse_failed",
+                raw=decision.raw_text,
+            )
 
     def _strategy_context(self) -> str:
         parts = [
+            "\n".join(self.storage.recent_real_experiences(limit=16)),
             "\n".join(self.storage.recent_strategy_lessons()),
             "\n".join(self.storage.recent_trade_reviews()),
             "\n".join(self.storage.recent_intelligence(self.settings.intelligence_max_items)),
@@ -356,14 +425,54 @@ class MomentumBotRunner:
 
     def _execute_buy_decision(self, candidate: CandidateScore, decision: dict, scan: MomentumScan) -> None:
         if not self._execution_buy_allowed(decision):
+            self.storage.save_execution_event(
+                candidate.symbol,
+                "SPOT",
+                "long",
+                "buy",
+                "entry_decision",
+                "blocked",
+                "execution_guard",
+                reason=str(decision.get("reason") or "buy not allowed"),
+            )
             return
         if self.storage.pending_entry_orders(candidate.symbol):
             self.storage.save_strategy_lesson(candidate.symbol, 0.0, 0.0, "execution_wait:pending_entry_order", "")
+            self.storage.save_execution_event(
+                candidate.symbol,
+                "SPOT",
+                "long",
+                "buy",
+                "entry_decision",
+                "pending_entry_order",
+                "execution_guard",
+                reason="已有 pending 限价入场单，跳过重复下单",
+            )
             return
         if self.storage.open_position_count() >= self.settings.max_open_positions:
             if str(decision.get("replace_mode")) != "replace_weakest":
+                self.storage.save_execution_event(
+                    candidate.symbol,
+                    "SPOT",
+                    "long",
+                    "buy",
+                    "entry_decision",
+                    "blocked",
+                    "execution_guard",
+                    reason="持仓已满且未允许换仓",
+                )
                 return
             if not self._replace_weakest_position(scan, f"换仓买入{candidate.symbol}: {decision.get('reason') or ''}"):
+                self.storage.save_execution_event(
+                    candidate.symbol,
+                    "SPOT",
+                    "long",
+                    "buy",
+                    "entry_decision",
+                    "blocked",
+                    "execution_guard",
+                    reason="换仓卖出未完成，跳过买入",
+                )
                 return
 
         entry_mode = str(decision.get("entry_mode") or "market_now")
@@ -371,7 +480,28 @@ class MomentumBotRunner:
         reason = str(decision.get("reason") or candidate.reason)
         if entry_mode in {"wait", "breakout_confirm"}:
             self.storage.save_strategy_lesson(candidate.symbol, 0.0, 0.0, f"execution_wait:{entry_mode}:{reason}", "")
+            self.storage.save_execution_event(
+                candidate.symbol,
+                "SPOT",
+                "long",
+                "buy",
+                "entry_decision",
+                entry_mode,
+                "execution_guard",
+                reason=reason,
+            )
             return
+        if str(reason).startswith("rules_first_buy:"):
+            self.storage.save_execution_event(
+                candidate.symbol,
+                "SPOT",
+                "long",
+                "buy",
+                "entry_decision",
+                "approved",
+                "rules_decision",
+                reason=reason,
+            )
         if entry_mode == "limit_pullback" and self.settings.limit_order_enabled:
             self._place_limit_buy(candidate, quote_amount, candidate.price * 0.997, reason)
             return
@@ -623,7 +753,7 @@ class MomentumBotRunner:
             self._cancel_active_stop_losses(position.symbol)
             self._exited_symbols.add(_spot_symbol(position.symbol))
         self.storage.save_strategy_lesson(position.symbol, pnl, return_pct, f"ai_sell:{reason}", str(result.raw), position.market_type, position.direction)
-        self._record_trade_attribution(position.symbol, pnl, return_pct, f"卖出完成: {reason}")
+        self._record_trade_attribution(position.symbol, pnl, return_pct, f"卖出完成: {reason}", position)
 
     def _replace_weakest_position(self, scan: MomentumScan, reason: str) -> bool:
         prices = {ticker.symbol: ticker.last for ticker in scan.tickers}
@@ -660,6 +790,20 @@ class MomentumBotRunner:
                 payload = self.exchange.get_order_details(symbol, order_id)
             except Exception as exc:
                 self.storage.save_bot_error("order_sync", f"{symbol} order sync failed", str(exc))
+                self.storage.save_execution_event(
+                    symbol,
+                    str(order.get("market_type") or "SPOT"),
+                    str(order.get("direction") or "long"),
+                    str(order.get("side") or "buy"),
+                    "order_sync",
+                    "failed",
+                    "okx_order_sync",
+                    client_order_id=str(order.get("client_order_id") or ""),
+                    exchange_order_id=order_id,
+                    order_type=str(order.get("order_type") or ""),
+                    reason="get_order_details failed",
+                    error=str(exc),
+                )
                 continue
             state = _order_state(payload)
             filled_size = _filled_size_from_order_payload(payload)
@@ -749,16 +893,75 @@ class MomentumBotRunner:
         self.storage.save_bot_error("execution", f"{symbol} {summary}", error)
         self.storage.save_strategy_lesson(symbol, 0.0, 0.0, f"execution_failed:{summary}:{error}", str(raw))
         self.storage.save_trade_attribution(symbol, 0.0, 0.0, "执行失败", 1.0, f"{summary}: {error}", self._current_market_regime(), str(raw))
+        self.storage.save_execution_event(
+            symbol,
+            "SPOT",
+            "long",
+            "",
+            "execution_failure",
+            "failed",
+            "execution_failure",
+            reason=summary,
+            error=error,
+            raw=json.dumps(raw, ensure_ascii=False),
+        )
+        self.storage.save_real_experience(
+            symbol,
+            "SPOT",
+            "long",
+            self._current_market_regime(),
+            "execute",
+            "failed",
+            confidence=0.0,
+            reason=f"{summary}: {error}",
+            source="execution_failure",
+            raw=json.dumps(raw, ensure_ascii=False),
+        )
 
     def _record_trade_attribution(self, symbol: str, pnl: float, return_pct: float, summary: str, position: Position | None = None) -> None:
         market_type = position.market_type if position is not None else "SPOT"
         direction = position.direction if position is not None else "long"
         experiment_cost = abs(pnl) * 0.02 + abs(return_pct) * 0.05
         if not self.settings.ai_review_enabled:
-            self.storage.save_trade_attribution(symbol, pnl, return_pct, "未知", 0.0, summary, self._current_market_regime(), "")
+            self.storage.save_trade_attribution(
+                symbol,
+                pnl,
+                return_pct,
+                "未知",
+                0.0,
+                summary,
+                self._current_market_regime(),
+                "",
+                market_type,
+                direction,
+                experiment_cost,
+            )
             return
         attribution = AiReviewClient(self.settings).attribute_trade(symbol, pnl, return_pct, summary, self._strategy_context())
-        if getattr(attribution, "ok", False) is True:
+        attribution_ok = getattr(attribution, "ok", False) is True
+        attribution_reason = getattr(attribution, "reason", "") if isinstance(getattr(attribution, "reason", ""), str) else ""
+        attribution_error = getattr(attribution, "error", "") if isinstance(getattr(attribution, "error", ""), str) else ""
+        attribution_confidence = getattr(attribution, "confidence", 0.0)
+        if not isinstance(attribution_confidence, (int, float)):
+            attribution_confidence = 0.0
+        self.storage.save_ai_call_audit(
+            symbol=symbol,
+            intent="attribution",
+            ok=attribution_ok,
+            action="hold",
+            confidence=float(attribution_confidence or 0.0),
+            prompt_chars=_int_attr(attribution, "prompt_chars"),
+            response_chars=_int_attr(attribution, "response_chars"),
+            duration_ms=_int_attr(attribution, "duration_ms"),
+            error="" if attribution_ok else attribution_error,
+            reason=attribution_reason if attribution_ok else attribution_error,
+            prompt_tokens=_int_attr(attribution, "prompt_tokens"),
+            completion_tokens=_int_attr(attribution, "completion_tokens"),
+            total_tokens=_int_attr(attribution, "total_tokens"),
+            attempted_tokens=_int_attr(attribution, "attempted_tokens"),
+            retry_count=_int_attr(attribution, "retry_count"),
+        )
+        if attribution_ok:
             category = attribution.category if isinstance(attribution.category, str) else "未知"
             reason = attribution.reason if isinstance(attribution.reason, str) else summary
             raw_text = attribution.raw_text if isinstance(attribution.raw_text, str) else ""
@@ -780,8 +983,23 @@ class MomentumBotRunner:
                 experiment_cost,
             )
         else:
-            error = getattr(attribution, "error", "") or summary
-            self.storage.save_trade_attribution(symbol, pnl, return_pct, "未知", 0.0, str(error), self._current_market_regime(), "")
+            error = attribution_error or summary
+            raw_text = getattr(attribution, "raw_text", "")
+            if not isinstance(raw_text, str):
+                raw_text = ""
+            self.storage.save_trade_attribution(
+                symbol,
+                pnl,
+                return_pct,
+                "未知",
+                0.0,
+                str(error),
+                self._current_market_regime(),
+                raw_text,
+                market_type,
+                direction,
+                experiment_cost,
+            )
 
     def _dry_run_buy(self, candidate: CandidateScore, quote_amount: float, order_type: str = "market"):
         from okx_quant_bot.models import OrderRequest
@@ -1038,6 +1256,9 @@ class MomentumBotRunner:
                 f"本地盈亏比: {snapshot['return_pct']:+.2f}%",
                 self.storage.recent_ai_call_summary(),
                 self.storage.recent_ai_call_breakdown(),
+                self.storage.recent_ai_call_breakdown_since_start(),
+                self.storage.execution_summary(),
+                self.storage.real_experience_summary(),
             ]
         )
         if ai_note:
@@ -1114,6 +1335,13 @@ class MomentumBotRunner:
     def _is_paused(self) -> bool:
         return self.storage.get_state("bot_paused", "0") == "1"
 
+    def _ensure_runtime_started(self) -> None:
+        if not self.storage.get_state("runtime_started_at", ""):
+            self._mark_runtime_started()
+
+    def _mark_runtime_started(self) -> None:
+        self.storage.set_state("runtime_started_at", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
+
     def _save_config_snapshot(self) -> None:
         payload = {
             "okx_demo": self.settings.okx_demo,
@@ -1178,6 +1406,7 @@ class MomentumBotRunner:
                 f"配置自检: {warning or '正常'}",
                 self.storage.recent_ai_call_summary(),
                 self.storage.recent_ai_call_breakdown(),
+                self.storage.recent_ai_call_breakdown_since_start(),
             ]
         )
 
@@ -1215,6 +1444,8 @@ class MomentumBotRunner:
         lines = [self.storage.training_summary(current_week_key(), self.settings.ai_weekly_token_target)]
         lines.insert(0, "真实模拟盘经验训练:")
         lines.append(self.storage.recent_ai_call_breakdown())
+        lines.append(self.storage.recent_ai_call_breakdown_since_start())
+        lines.append(self.storage.real_experience_summary())
         if self.training_pool is not None:
             status = self.training_pool.status()
             lines.append(
@@ -1243,6 +1474,7 @@ class MomentumBotRunner:
                 f"Telegram: {'正常' if not getattr(self.notifier, 'last_error', '') else '异常: ' + self.notifier.last_error[:120]}",
                 f"AI配置: {warning or '正常'}",
                 f"AI后台决策: pending={pending_ai}",
+                self.storage.recent_ai_call_breakdown_since_start(),
                 (
                     "训练池: "
                     f"线程{pool_status.get('alive_threads', 0)}/{pool_status.get('threads', 0)}，"
@@ -1281,15 +1513,15 @@ class MomentumBotRunner:
         )
         guard = f"{guard}\n{route}"
         if not decisions:
-            return "\n".join([guard, "暂无AI执行决策。"])
-        return "\n".join([guard, "最近AI执行决策:", *decisions])
+            return "\n".join([guard, self.storage.execution_summary(), "暂无AI执行决策。"])
+        return "\n".join([guard, self.storage.execution_summary(), "最近AI执行决策:", *decisions])
 
     def _lessons_message(self) -> str:
         lessons = self.storage.recent_trade_attributions(limit=12)
         experience = self.storage.experience_summary()
         if not lessons:
-            return "暂无交易归因。"
-        return "\n".join(["最近交易归因:", *lessons])
+            return "\n".join(["暂无交易归因。", experience, self.storage.real_experience_summary()])
+        return "\n".join(["最近交易归因:", *lessons, experience, self.storage.real_experience_summary()])
 
     def _market_message(self) -> str:
         regimes = self.storage.recent_market_regimes(limit=6)
@@ -1405,3 +1637,8 @@ def _float_or_none(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _int_attr(obj: object, name: str) -> int:
+    value = getattr(obj, name, 0)
+    return int(value) if isinstance(value, (int, float)) else 0

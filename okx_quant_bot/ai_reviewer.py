@@ -85,6 +85,14 @@ class AiMarketRegime:
     reason: str = ""
     raw_text: str = ""
     error: str = ""
+    prompt_chars: int = 0
+    response_chars: int = 0
+    duration_ms: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    attempted_tokens: int = 0
+    retry_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -95,6 +103,14 @@ class AiTradeAttribution:
     reason: str = ""
     raw_text: str = ""
     error: str = ""
+    prompt_chars: int = 0
+    response_chars: int = 0
+    duration_ms: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    attempted_tokens: int = 0
+    retry_count: int = 0
 
 
 class AiReviewClient:
@@ -120,18 +136,19 @@ class AiReviewClient:
             return AiReview(False, "", "AI未启用或缺少 OPENAI_API_KEY/MIMO_API_KEY。")
         prompt = _scan_prompt(self.settings, scan, open_position_count, strategy_memory)
         result = self._complete(prompt)
+        review_ok, review_text, review_error, repaired = self._parse_scan_review_with_repair(result) if result.ok else (False, "", result.error, None)
         return AiReview(
-            ok=result.ok,
-            text=_telegram_sized(result.raw_text) if result.ok else "",
-            error="" if result.ok else result.error,
-            prompt_chars=result.prompt_chars,
-            response_chars=result.response_chars,
-            duration_ms=result.duration_ms,
-            prompt_tokens=result.prompt_tokens,
-            completion_tokens=result.completion_tokens,
-            total_tokens=result.total_tokens,
-            attempted_tokens=result.attempted_tokens,
-            retry_count=result.retry_count,
+            ok=review_ok,
+            text=_telegram_sized(review_text) if review_ok else "",
+            error="" if review_ok else review_error,
+            prompt_chars=result.prompt_chars + int(getattr(repaired, "prompt_chars", 0) if repaired else 0),
+            response_chars=result.response_chars + int(getattr(repaired, "response_chars", 0) if repaired else 0),
+            duration_ms=result.duration_ms + int(getattr(repaired, "duration_ms", 0) if repaired else 0),
+            prompt_tokens=result.prompt_tokens + int(getattr(repaired, "prompt_tokens", 0) if repaired else 0),
+            completion_tokens=result.completion_tokens + int(getattr(repaired, "completion_tokens", 0) if repaired else 0),
+            total_tokens=result.total_tokens + int(getattr(repaired, "total_tokens", 0) if repaired else 0),
+            attempted_tokens=result.attempted_tokens + int(getattr(repaired, "attempted_tokens", 0) if repaired else 0),
+            retry_count=result.retry_count + int(getattr(repaired, "retry_count", 0) if repaired else 0),
         )
 
     def decide_buy(
@@ -143,7 +160,7 @@ class AiReviewClient:
         market_regime: str = "",
     ) -> AiTradeDecision:
         prompt = _buy_prompt(self.settings, scan, candidate, open_position_count, strategy_memory, market_regime)
-        return self._decide(prompt)
+        return self._decide(prompt, "buy")
 
     def decide_sell(
         self,
@@ -154,13 +171,24 @@ class AiReviewClient:
         market_regime: str = "",
     ) -> AiTradeDecision:
         prompt = _sell_prompt(self.settings, scan, position, current_price, strategy_memory, market_regime)
-        return self._decide(prompt)
+        return self._decide(prompt, "sell")
 
     def decide_market_regime(self, scan: MomentumScan, strategy_memory: str = "") -> AiMarketRegime:
         result = self._complete(_market_regime_prompt(scan, strategy_memory))
         if not result.ok:
-            return AiMarketRegime(False, error=result.error)
-        return _parse_market_regime(result.raw_text)
+            return AiMarketRegime(
+                False,
+                error=result.error,
+                prompt_chars=result.prompt_chars,
+                response_chars=result.response_chars,
+                duration_ms=result.duration_ms,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                total_tokens=result.total_tokens,
+                attempted_tokens=result.attempted_tokens,
+                retry_count=result.retry_count,
+            )
+        return self._parse_market_regime_with_repair(result)
 
     def attribute_trade(
         self,
@@ -172,19 +200,30 @@ class AiReviewClient:
     ) -> AiTradeAttribution:
         result = self._complete(_attribution_prompt(symbol, pnl_usdt, return_pct, summary, strategy_memory))
         if not result.ok:
-            return AiTradeAttribution(False, error=result.error)
-        return _parse_trade_attribution(result.raw_text)
+            return AiTradeAttribution(
+                False,
+                error=result.error,
+                prompt_chars=result.prompt_chars,
+                response_chars=result.response_chars,
+                duration_ms=result.duration_ms,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                total_tokens=result.total_tokens,
+                attempted_tokens=result.attempted_tokens,
+                retry_count=result.retry_count,
+            )
+        return self._parse_trade_attribution_with_repair(result)
 
     def complete_training(self, prompt: str) -> AiTradeDecision:
-        return self._complete(prompt)
+        return self._decide(prompt, "training")
 
-    def _decide(self, prompt: str) -> AiTradeDecision:
+    def _decide(self, prompt: str, parse_source: str) -> AiTradeDecision:
         result = self._complete(prompt)
         if not result.ok:
             return result
         parsed = _parse_trade_decision(result.raw_text)
         if not parsed.ok:
-            repaired = self._complete(_json_repair_prompt(result.raw_text))
+            repaired = self._complete(_json_repair_prompt(result.raw_text, _trade_decision_schema()))
             if repaired.ok:
                 repaired_parsed = _parse_trade_decision(repaired.raw_text)
                 if repaired_parsed.ok:
@@ -208,10 +247,11 @@ class AiReviewClient:
                         attempted_tokens=result.attempted_tokens + repaired.attempted_tokens,
                         retry_count=result.retry_count + repaired.retry_count,
                     )
+            error = _parse_failed_error(parse_source, parsed.error)
             return AiTradeDecision(
                 False,
                 raw_text=result.raw_text,
-                error=parsed.error,
+                error=error,
                 prompt_chars=result.prompt_chars + getattr(repaired, "prompt_chars", 0),
                 response_chars=result.response_chars + getattr(repaired, "response_chars", 0),
                 duration_ms=result.duration_ms + getattr(repaired, "duration_ms", 0),
@@ -242,6 +282,119 @@ class AiReviewClient:
             attempted_tokens=result.attempted_tokens,
             retry_count=result.retry_count,
         )
+
+    def _parse_market_regime_with_repair(self, result: AiTradeDecision) -> AiMarketRegime:
+        parsed = _parse_market_regime(result.raw_text)
+        if parsed.ok:
+            return AiMarketRegime(
+                True,
+                regime=parsed.regime,
+                confidence=parsed.confidence,
+                reason=parsed.reason,
+                raw_text=parsed.raw_text,
+                prompt_chars=result.prompt_chars,
+                response_chars=result.response_chars,
+                duration_ms=result.duration_ms,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                total_tokens=result.total_tokens,
+                attempted_tokens=result.attempted_tokens,
+                retry_count=result.retry_count,
+            )
+        repaired = self._complete(_json_repair_prompt(result.raw_text, _market_regime_schema()))
+        if repaired.ok:
+            repaired_parsed = _parse_market_regime(repaired.raw_text)
+            if repaired_parsed.ok:
+                return AiMarketRegime(
+                    True,
+                    regime=repaired_parsed.regime,
+                    confidence=repaired_parsed.confidence,
+                    reason=repaired_parsed.reason,
+                    raw_text=repaired.raw_text,
+                    prompt_chars=result.prompt_chars + repaired.prompt_chars,
+                    response_chars=result.response_chars + repaired.response_chars,
+                    duration_ms=result.duration_ms + repaired.duration_ms,
+                    prompt_tokens=result.prompt_tokens + repaired.prompt_tokens,
+                    completion_tokens=result.completion_tokens + repaired.completion_tokens,
+                    total_tokens=result.total_tokens + repaired.total_tokens,
+                    attempted_tokens=result.attempted_tokens + repaired.attempted_tokens,
+                    retry_count=result.retry_count + repaired.retry_count,
+                )
+        return AiMarketRegime(
+            False,
+            raw_text=result.raw_text,
+            error=_parse_failed_error("market_regime", parsed.error),
+            prompt_chars=result.prompt_chars + getattr(repaired, "prompt_chars", 0),
+            response_chars=result.response_chars + getattr(repaired, "response_chars", 0),
+            duration_ms=result.duration_ms + getattr(repaired, "duration_ms", 0),
+            prompt_tokens=result.prompt_tokens + getattr(repaired, "prompt_tokens", 0),
+            completion_tokens=result.completion_tokens + getattr(repaired, "completion_tokens", 0),
+            total_tokens=result.total_tokens + getattr(repaired, "total_tokens", 0),
+            attempted_tokens=result.attempted_tokens + getattr(repaired, "attempted_tokens", 0),
+            retry_count=result.retry_count + getattr(repaired, "retry_count", 0),
+        )
+
+    def _parse_trade_attribution_with_repair(self, result: AiTradeDecision) -> AiTradeAttribution:
+        parsed = _parse_trade_attribution(result.raw_text)
+        if parsed.ok:
+            return AiTradeAttribution(
+                True,
+                category=parsed.category,
+                confidence=parsed.confidence,
+                reason=parsed.reason,
+                raw_text=parsed.raw_text,
+                prompt_chars=result.prompt_chars,
+                response_chars=result.response_chars,
+                duration_ms=result.duration_ms,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                total_tokens=result.total_tokens,
+                attempted_tokens=result.attempted_tokens,
+                retry_count=result.retry_count,
+            )
+        repaired = self._complete(_json_repair_prompt(result.raw_text, _attribution_schema()))
+        if repaired.ok:
+            repaired_parsed = _parse_trade_attribution(repaired.raw_text)
+            if repaired_parsed.ok:
+                return AiTradeAttribution(
+                    True,
+                    category=repaired_parsed.category,
+                    confidence=repaired_parsed.confidence,
+                    reason=repaired_parsed.reason,
+                    raw_text=repaired.raw_text,
+                    prompt_chars=result.prompt_chars + repaired.prompt_chars,
+                    response_chars=result.response_chars + repaired.response_chars,
+                    duration_ms=result.duration_ms + repaired.duration_ms,
+                    prompt_tokens=result.prompt_tokens + repaired.prompt_tokens,
+                    completion_tokens=result.completion_tokens + repaired.completion_tokens,
+                    total_tokens=result.total_tokens + repaired.total_tokens,
+                    attempted_tokens=result.attempted_tokens + repaired.attempted_tokens,
+                    retry_count=result.retry_count + repaired.retry_count,
+                )
+        return AiTradeAttribution(
+            False,
+            raw_text=result.raw_text,
+            error=_parse_failed_error("attribution", parsed.error),
+            prompt_chars=result.prompt_chars + getattr(repaired, "prompt_chars", 0),
+            response_chars=result.response_chars + getattr(repaired, "response_chars", 0),
+            duration_ms=result.duration_ms + getattr(repaired, "duration_ms", 0),
+            prompt_tokens=result.prompt_tokens + getattr(repaired, "prompt_tokens", 0),
+            completion_tokens=result.completion_tokens + getattr(repaired, "completion_tokens", 0),
+            total_tokens=result.total_tokens + getattr(repaired, "total_tokens", 0),
+            attempted_tokens=result.attempted_tokens + getattr(repaired, "attempted_tokens", 0),
+            retry_count=result.retry_count + getattr(repaired, "retry_count", 0),
+        )
+
+    def _parse_scan_review_with_repair(self, result: AiTradeDecision) -> tuple[bool, str, str, AiTradeDecision | None]:
+        parsed = _parse_scan_review(result.raw_text)
+        if parsed is not None:
+            return True, parsed, "", None
+        repaired = self._complete(_json_repair_prompt(result.raw_text, _scan_review_schema()))
+        if repaired.ok:
+            repaired_parsed = _parse_scan_review(repaired.raw_text)
+            if repaired_parsed is not None:
+                return True, repaired_parsed, "", repaired
+        return False, "", _parse_failed_error("scan", "AI 扫描复盘 JSON 解析失败。"), repaired
 
     def _complete(self, prompt: str) -> AiTradeDecision:
         if not self.enabled:
@@ -462,15 +615,49 @@ def _attribution_prompt(symbol: str, pnl_usdt: float, return_pct: float, summary
     )
 
 
-def _json_repair_prompt(raw_text: str) -> str:
+def _json_repair_prompt(raw_text: str, schema: str | None = None) -> str:
     return "\n".join(
         [
-            "把下面的交易决策修复成严格 JSON，不要解释，不要 Markdown。",
-            '必须符合: {"action":"buy|hold|sell","entry_mode":"market_now|limit_pullback|split_limit|breakout_confirm|wait","exit_mode":"hold|sell_all|sell_partial|trail_profit|move_to_breakeven","size_mode":"explore|normal|strong|reduced","stop_mode":"fixed|wide|tight|breakeven|trailing","replace_mode":"none|replace_weakest|free_cash_only","confidence":0.0,"reason":"中文原因"}',
+            "把下面内容修复成严格 JSON，不要解释，不要 Markdown。",
+            f"必须符合: {schema or _trade_decision_schema()}",
             "原始内容:",
             raw_text[:4000],
         ]
     )
+
+
+def _trade_decision_schema() -> str:
+    return (
+        '{"action":"buy|hold|sell","entry_mode":"market_now|limit_pullback|split_limit|breakout_confirm|wait",'
+        '"exit_mode":"hold|sell_all|sell_partial|trail_profit|move_to_breakeven",'
+        '"size_mode":"explore|normal|strong|reduced","stop_mode":"fixed|wide|tight|breakeven|trailing",'
+        '"replace_mode":"none|replace_weakest|free_cash_only","confidence":0.0,"reason":"中文原因"}'
+    )
+
+
+def _market_regime_schema() -> str:
+    return '{"regime":"单边上涨|震荡|急跌反弹|高波动插针|主流吸血|山寨轮动","confidence":0.0,"reason":"中文原因"}'
+
+
+def _attribution_schema() -> str:
+    return '{"category":"追高|假突破|流动性不足|新闻误判|止损太紧|止盈太早|入场太晚|执行失败|未知","confidence":0.0,"reason":"中文原因"}'
+
+
+def _scan_review_schema() -> str:
+    return '{"summary":"中文资金结论"}'
+
+
+def _parse_failed_error(source: str, error: str) -> str:
+    source_map = {
+        "buy": "buy_parse_failed",
+        "sell": "sell_parse_failed",
+        "training": "training_parse_failed",
+        "portfolio_training": "training_parse_failed",
+        "market_regime": "market_regime_parse_failed",
+        "attribution": "attribution_parse_failed",
+        "scan": "scan_parse_failed",
+    }
+    return f"{source_map.get(source, source + '_parse_failed')}: {error}"
 
 
 def _candidate_lines(candidate: CandidateScore, signals: list[InfoSignal]) -> list[str]:
@@ -519,6 +706,22 @@ def _parse_trade_decision(text: str) -> AiTradeDecision:
         stop_mode=_choice(payload.get("stop_mode"), STOP_MODES, "fixed"),
         replace_mode=_choice(payload.get("replace_mode"), REPLACE_MODES, "none"),
     )
+
+
+def _parse_scan_review(text: str) -> str | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    payload = _json_payload(stripped)
+    if payload is None:
+        if "{" in stripped or "}" in stripped:
+            return None
+        return stripped
+    for key in ("summary", "reason", "text"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _parse_market_regime(text: str) -> AiMarketRegime:

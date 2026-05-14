@@ -19,6 +19,10 @@ class TrainingTask:
     intent: str
     prompt: str
     market_type: str = "spot"
+    direction: str = "long"
+    market_regime: str = ""
+    pnl_usdt: float = 0.0
+    return_pct: float = 0.0
     strategy: str = "复盘"
 
 
@@ -78,6 +82,9 @@ class AiTrainingPool:
                     intent="portfolio_training",
                     prompt=_position_training_prompt(position, current_price, market_snapshot, strategy_context),
                     market_type=position.market_type.lower(),
+                    direction=position.direction,
+                    pnl_usdt=position.pnl(current_price),
+                    return_pct=position.return_pct(current_price),
                     strategy="真实模拟盘持仓复盘",
                 )
             )
@@ -108,6 +115,23 @@ class AiTrainingPool:
 
     def _handle_task(self, client: AiReviewClient, task: TrainingTask) -> None:
         result = client.complete_training(task.prompt)
+        experience_saved = False
+        if result.ok:
+            self.storage.save_real_experience(
+                symbol=task.symbol,
+                market_type=task.market_type.upper(),
+                direction=task.direction,
+                market_regime=task.market_regime,
+                action=result.action,
+                result="training_signal",
+                pnl_usdt=task.pnl_usdt,
+                return_pct=task.return_pct,
+                confidence=float(result.confidence),
+                reason=result.reason,
+                source=task.intent,
+                raw=result.raw_text,
+            )
+            experience_saved = True
         self.storage.save_ai_call_audit(
             symbol=task.symbol,
             intent=task.intent,
@@ -133,6 +157,7 @@ class AiTrainingPool:
             total_tokens=result.total_tokens,
             attempted_tokens=result.attempted_tokens,
             ok=result.ok,
+            experience_saved=experience_saved,
         )
 
 

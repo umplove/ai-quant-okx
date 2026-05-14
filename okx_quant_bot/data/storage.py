@@ -310,6 +310,41 @@ class Storage:
                     created_at text default current_timestamp
                 );
 
+                create table if not exists real_experiences (
+                    id integer primary key autoincrement,
+                    symbol text not null,
+                    market_type text not null default 'SPOT',
+                    direction text not null default 'long',
+                    market_regime text not null default '',
+                    action text not null,
+                    result text not null,
+                    pnl_usdt real not null default 0,
+                    return_pct real not null default 0,
+                    confidence real not null default 0,
+                    reason text not null,
+                    source text not null,
+                    raw text not null,
+                    created_at text default current_timestamp
+                );
+
+                create table if not exists execution_events (
+                    id integer primary key autoincrement,
+                    symbol text not null,
+                    market_type text not null default 'SPOT',
+                    direction text not null default 'long',
+                    side text not null default '',
+                    action text not null,
+                    status text not null,
+                    source text not null,
+                    client_order_id text not null default '',
+                    exchange_order_id text,
+                    order_type text not null default '',
+                    reason text not null,
+                    error text not null default '',
+                    raw text not null,
+                    created_at text default current_timestamp
+                );
+
                 create table if not exists experience_scores (
                     symbol text not null,
                     market_type text not null,
@@ -376,6 +411,7 @@ class Storage:
             self._ensure_column(conn, "trade_attributions", "experiment_cost", "real not null default 0")
             self._ensure_column(conn, "trade_attributions", "experience_score", "real not null default 0")
             self._ensure_column(conn, "trade_attributions", "tier", "text not null default 'active'")
+            self._ensure_column(conn, "ai_training_runs", "experience_count", "integer not null default 0")
             self._ensure_column(conn, "stop_loss_orders", "active", "integer not null default 1")
             self._ensure_column(conn, "stop_loss_orders", "updated_at", "text")
             conn.execute("update orders set updated_at = coalesce(updated_at, created_at, current_timestamp)")
@@ -388,6 +424,152 @@ class Storage:
         columns = {row["name"] for row in conn.execute(f"pragma table_info({table})").fetchall()}
         if column not in columns:
             conn.execute(f"alter table {table} add column {column} {definition}")
+
+    @staticmethod
+    def _insert_real_experience(
+        conn: sqlite3.Connection,
+        symbol: str,
+        market_type: str,
+        direction: str,
+        market_regime: str,
+        action: str,
+        result: str,
+        pnl_usdt: float,
+        return_pct: float,
+        confidence: float,
+        reason: str,
+        source: str,
+        raw: str = "",
+    ) -> None:
+        conn.execute(
+            """
+            insert into real_experiences(
+                symbol, market_type, direction, market_regime, action, result,
+                pnl_usdt, return_pct, confidence, reason, source, raw
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                symbol,
+                str(market_type or "SPOT").upper(),
+                direction or "long",
+                market_regime[:100],
+                action[:60],
+                result[:60],
+                float(pnl_usdt or 0.0),
+                float(return_pct or 0.0),
+                float(confidence or 0.0),
+                reason[:1000],
+                source[:100],
+                raw[:4000],
+            ),
+        )
+
+    @staticmethod
+    def _insert_execution_event(
+        conn: sqlite3.Connection,
+        symbol: str,
+        market_type: str,
+        direction: str,
+        side: str,
+        action: str,
+        status: str,
+        source: str,
+        client_order_id: str = "",
+        exchange_order_id: str | None = None,
+        order_type: str = "",
+        reason: str = "",
+        error: str = "",
+        raw: str = "",
+    ) -> None:
+        conn.execute(
+            """
+            insert into execution_events(
+                symbol, market_type, direction, side, action, status, source,
+                client_order_id, exchange_order_id, order_type, reason, error, raw
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                symbol,
+                str(market_type or "SPOT").upper(),
+                direction or "long",
+                side[:20],
+                action[:80],
+                status[:80],
+                source[:100],
+                client_order_id[:100],
+                exchange_order_id,
+                order_type[:40],
+                reason[:1000],
+                error[:1000],
+                raw[:4000],
+            ),
+        )
+
+    def save_real_experience(
+        self,
+        symbol: str,
+        market_type: str,
+        direction: str,
+        market_regime: str,
+        action: str,
+        result: str,
+        pnl_usdt: float = 0.0,
+        return_pct: float = 0.0,
+        confidence: float = 0.0,
+        reason: str = "",
+        source: str = "",
+        raw: str = "",
+    ) -> None:
+        with self.session() as conn:
+            self._insert_real_experience(
+                conn,
+                symbol,
+                market_type,
+                direction,
+                market_regime,
+                action,
+                result,
+                pnl_usdt,
+                return_pct,
+                confidence,
+                reason,
+                source,
+                raw,
+            )
+
+    def save_execution_event(
+        self,
+        symbol: str,
+        market_type: str,
+        direction: str,
+        side: str,
+        action: str,
+        status: str,
+        source: str,
+        client_order_id: str = "",
+        exchange_order_id: str | None = None,
+        order_type: str = "",
+        reason: str = "",
+        error: str = "",
+        raw: str = "",
+    ) -> None:
+        with self.session() as conn:
+            self._insert_execution_event(
+                conn,
+                symbol,
+                market_type,
+                direction,
+                side,
+                action,
+                status,
+                source,
+                client_order_id,
+                exchange_order_id,
+                order_type,
+                reason,
+                error,
+                raw,
+            )
 
     def save_candles(self, candles: Iterable[Candle]) -> None:
         with self.session() as conn:
@@ -468,6 +650,40 @@ class Storage:
                     fill_price,
                 ),
             )
+            raw_text = json.dumps(result.raw, ensure_ascii=False)
+            event_source = _order_event_source(result.raw)
+            event_status = "not_sent_local_validation" if event_source == "local_validation" else order_status
+            self._insert_execution_event(
+                conn,
+                symbol=request.symbol,
+                market_type=request.market_type,
+                direction=request.direction,
+                side=request.side.value,
+                action="order",
+                status=event_status,
+                source=event_source,
+                client_order_id=request.client_order_id,
+                exchange_order_id=result.order_id,
+                order_type=request.order_type,
+                reason=request.reason,
+                error=result.error or "",
+                raw=raw_text,
+            )
+            self._insert_real_experience(
+                conn,
+                symbol=request.symbol,
+                market_type=request.market_type,
+                direction=request.direction,
+                market_regime="",
+                action=request.side.value,
+                result=event_status if result.ok else "failed",
+                pnl_usdt=0.0,
+                return_pct=0.0,
+                confidence=1.0 if result.ok else 0.0,
+                reason=request.reason if result.ok else f"{request.reason}: {result.error or 'unknown'}",
+                source=event_source,
+                raw=raw_text,
+            )
 
     def update_order_fill(
         self,
@@ -482,7 +698,7 @@ class Storage:
         import json
 
         with self.session() as conn:
-            row = conn.execute("select raw from orders where client_order_id = ?", (client_order_id,)).fetchone()
+            row = conn.execute("select * from orders where client_order_id = ?", (client_order_id,)).fetchone()
             raw_text = json.dumps(raw, ensure_ascii=False) if raw is not None else (row["raw"] if row else "{}")
             conn.execute(
                 """
@@ -502,6 +718,45 @@ class Storage:
                     client_order_id,
                 ),
             )
+            if row is not None:
+                side = str(row["side"] or "")
+                symbol = str(row["symbol"] or "")
+                market_type = str(row["market_type"] or "SPOT")
+                direction = str(row["direction"] or "long")
+                order_type = str(row["order_type"] or "")
+                reason = str(row["reason"] or "")
+                self._insert_execution_event(
+                    conn,
+                    symbol=symbol,
+                    market_type=market_type,
+                    direction=direction,
+                    side=side,
+                    action="order_sync",
+                    status=status,
+                    source="okx_order_sync",
+                    client_order_id=client_order_id,
+                    exchange_order_id=exchange_order_id or row["exchange_order_id"],
+                    order_type=order_type,
+                    reason=reason,
+                    error=error or "",
+                    raw=raw_text,
+                )
+                if status in {"partial", "filled", "canceled", "rejected"}:
+                    self._insert_real_experience(
+                        conn,
+                        symbol=symbol,
+                        market_type=market_type,
+                        direction=direction,
+                        market_regime="",
+                        action=side or "order",
+                        result=status,
+                        pnl_usdt=0.0,
+                        return_pct=0.0,
+                        confidence=1.0 if status in {"partial", "filled"} else 0.0,
+                        reason=reason if not error else f"{reason}: {error}",
+                        source="okx_order_sync",
+                        raw=raw_text,
+                    )
 
     def pending_entry_orders(self, symbol: str | None = None) -> list[dict]:
         params: tuple = ()
@@ -834,6 +1089,22 @@ class Storage:
                     avg_fill_price,
                 ),
             )
+            self._insert_execution_event(
+                conn,
+                symbol=symbol,
+                market_type=str(market_type).upper(),
+                direction=direction,
+                side=side,
+                action="order_snapshot",
+                status=status,
+                source="okx_order_sync",
+                client_order_id=client_order_id,
+                exchange_order_id=row.get("ordId"),
+                order_type=order_type,
+                reason="okx_sync",
+                error="",
+                raw=json.dumps(row, ensure_ascii=False),
+            )
 
     def set_state(self, key: str, value: str) -> None:
         with self.session() as conn:
@@ -1075,24 +1346,25 @@ class Storage:
             f"{error_tail}"
         )
 
-    def recent_ai_call_breakdown(self, limit: int = 200) -> str:
+    def recent_ai_call_breakdown(self, limit: int = 200, since: str | None = None) -> str:
+        where = "where created_at >= ?" if since else ""
+        params: tuple = (since, limit) if since else (limit,)
         with self.session() as conn:
             rows = conn.execute(
-                """
+                f"""
                 select intent, ok, action, total_tokens, attempted_tokens, error
                 from ai_call_audits
+                {where}
                 order by created_at desc, id desc
                 limit ?
                 """,
-                (limit,),
+                params,
             ).fetchall()
         if not rows:
             return "AI去向: 暂无"
         buckets: dict[str, dict[str, int]] = {}
         for row in rows:
-            intent = str(row["intent"] or "unknown")
-            if row["error"] and "JSON" in str(row["error"]).upper():
-                intent = "parse_failed"
+            intent = _ai_bucket(str(row["intent"] or "unknown"), str(row["error"] or ""))
             bucket = buckets.setdefault(intent, {"count": 0, "ok": 0, "tokens": 0, "attempted": 0})
             bucket["count"] += 1
             bucket["ok"] += int(row["ok"])
@@ -1104,6 +1376,15 @@ class Storage:
         ]
         return "AI去向: " + "; ".join(parts[:8])
 
+    def recent_ai_call_breakdown_since_start(self, limit: int = 200) -> str:
+        started_at = self.get_state("runtime_started_at", "")
+        if not started_at:
+            return "本次启动后AI去向: 暂无启动时间"
+        text = self.recent_ai_call_breakdown(limit=limit, since=started_at)
+        if text == "AI去向: 暂无":
+            return "本次启动后AI去向: 暂无"
+        return text.replace("AI去向:", "本次启动后AI去向:", 1)
+
     def add_training_usage(
         self,
         week_key: str,
@@ -1113,6 +1394,7 @@ class Storage:
         total_tokens: int,
         attempted_tokens: int | bool = 0,
         ok: bool | None = None,
+        experience_saved: bool = False,
     ) -> None:
         if ok is None:
             ok = bool(attempted_tokens)
@@ -1122,8 +1404,8 @@ class Storage:
                 """
                 insert into ai_training_runs(
                     week_key, target_tokens, prompt_tokens, completion_tokens,
-                    total_tokens, attempted_tokens, task_count, success_count, error_count
-                ) values (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    total_tokens, attempted_tokens, task_count, success_count, error_count, experience_count
+                ) values (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                 on conflict(week_key) do update set
                     target_tokens = excluded.target_tokens,
                     prompt_tokens = ai_training_runs.prompt_tokens + excluded.prompt_tokens,
@@ -1133,6 +1415,7 @@ class Storage:
                     task_count = ai_training_runs.task_count + 1,
                     success_count = ai_training_runs.success_count + excluded.success_count,
                     error_count = ai_training_runs.error_count + excluded.error_count,
+                    experience_count = ai_training_runs.experience_count + excluded.experience_count,
                     updated_at = current_timestamp
                 """,
                 (
@@ -1144,6 +1427,7 @@ class Storage:
                     int(attempted_tokens or total_tokens or 0),
                     int(ok),
                     0 if ok else 1,
+                    int(bool(experience_saved)),
                 ),
             )
 
@@ -1151,13 +1435,14 @@ class Storage:
         with self.session() as conn:
             row = conn.execute("select * from ai_training_runs where week_key = ?", (week_key,)).fetchone()
         if row is None:
-            return f"训练进度: 成功0/{target_tokens} token，估算尝试0，完成率0.00%，任务0，成功0，失败0"
+            return f"训练进度: 成功0/{target_tokens} token，估算尝试0，完成率0.00%，任务0，成功0，失败0，经验入库=0/0"
         total_tokens = int(row["total_tokens"])
         attempted_tokens = int(row["attempted_tokens"])
         pct = 0.0 if target_tokens <= 0 else total_tokens / target_tokens * 100.0
         return (
             f"训练进度: 成功{total_tokens}/{target_tokens} token，估算尝试{attempted_tokens}，完成率{pct:.2f}%，"
-            f"任务{row['task_count']}，成功{row['success_count']}，失败{row['error_count']}"
+            f"任务{row['task_count']}，成功{row['success_count']}，失败{row['error_count']}，"
+            f"经验入库={row['experience_count']}/{row['success_count']}"
         )
 
     def save_shadow_decision(
@@ -1322,6 +1607,22 @@ class Storage:
                 ),
             )
             self._upsert_experience_score(conn, symbol, market_type, direction, float(score), tier_value, reason)
+            result = "profit" if float(pnl_usdt) > 0 else "loss" if float(pnl_usdt) < 0 else "flat"
+            self._insert_real_experience(
+                conn,
+                symbol=symbol,
+                market_type=market_type,
+                direction=direction,
+                market_regime=market_regime,
+                action="sell" if float(pnl_usdt) != 0 else "review",
+                result=result,
+                pnl_usdt=pnl_usdt,
+                return_pct=return_pct,
+                confidence=confidence,
+                reason=reason,
+                source="trade_attribution",
+                raw=raw,
+            )
 
     def recent_trade_attributions(self, limit: int = 10) -> list[str]:
         with self.session() as conn:
@@ -1342,6 +1643,182 @@ class Storage:
             f"conf={r['confidence']:.2f}: {r['reason']}"
             for r in rows
         ]
+
+    def recent_real_experiences(self, limit: int = 12) -> list[str]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select symbol, market_type, direction, market_regime, action, result,
+                       pnl_usdt, return_pct, confidence, reason, source, created_at
+                from real_experiences
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        if not rows:
+            return []
+        return [
+            f"{r['symbol']} {r['market_type']}/{r['direction']} {r['action']}->{r['result']} "
+            f"pnl={r['pnl_usdt']:+.2f} return={r['return_pct']:+.2f}% "
+            f"regime={r['market_regime'] or '未知'} conf={r['confidence']:.2f} "
+            f"source={r['source']}: {r['reason']}"
+            for r in rows
+        ]
+
+    def real_experience_summary(self, limit: int = 200) -> str:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select result, source, count(*) as count
+                from (
+                    select result, source
+                    from real_experiences
+                    order by created_at desc, id desc
+                    limit ?
+                )
+                group by result, source
+                order by count desc
+                """,
+                (limit,),
+            ).fetchall()
+            recent = conn.execute(
+                """
+                select symbol, market_type, direction, action, result, reason, source
+                from real_experiences
+                order by created_at desc, id desc
+                limit 5
+                """
+            ).fetchall()
+        if not rows:
+            return "真实经验: 暂无"
+        parts = [f"{r['result']}/{r['source']}={r['count']}" for r in rows[:8]]
+        lines = ["真实经验: " + "; ".join(parts)]
+        lines.extend(
+            f"{r['symbol']} {r['market_type']}/{r['direction']} {r['action']}->{r['result']} "
+            f"source={r['source']}: {r['reason']}"
+            for r in recent
+        )
+        return "\n".join(lines)
+
+    def recent_execution_events(self, limit: int = 10) -> list[str]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select symbol, market_type, direction, side, action, status, source,
+                       client_order_id, exchange_order_id, order_type, reason, error, created_at
+                from execution_events
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            f"{r['created_at']} {r['symbol']} {r['side']} {r['order_type']} {r['status']} "
+            f"source={r['source']} okx={r['exchange_order_id'] or '-'}: {r['error'] or r['reason']}"
+            for r in rows
+        ]
+
+    def execution_summary(self, limit: int = 200) -> str:
+        with self.session() as conn:
+            order_rows = conn.execute(
+                """
+                select side, status, ok, exchange_order_id, error
+                from orders
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+            ai_rows = conn.execute(
+                """
+                select intent, action
+                from execution_decisions
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+            rule_rows = conn.execute(
+                """
+                select side, status
+                from execution_events
+                where source = 'rules_decision'
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+            no_order_rows = conn.execute(
+                """
+                select symbol, status, reason, error
+                from execution_events
+                where status in (
+                    'blocked', 'skipped', 'wait', 'breakout_confirm',
+                    'pending_entry_order', 'not_sent_local_validation'
+                )
+                order by created_at desc, id desc
+                limit 5
+                """
+            ).fetchall()
+            recent_fills = conn.execute(
+                """
+                select symbol, side, status, filled_size, avg_fill_price, exchange_order_id
+                from orders
+                where status in ('filled', 'partial')
+                order by updated_at desc, id desc
+                limit 5
+                """
+            ).fetchall()
+            recent_failures = conn.execute(
+                """
+                select symbol, side, status, error, reason
+                from orders
+                where ok = 0 or status in ('rejected', 'canceled')
+                order by updated_at desc, id desc
+                limit 5
+                """
+            ).fetchall()
+        okx_orders = [
+            row
+            for row in order_rows
+            if row["exchange_order_id"] and str(row["exchange_order_id"]).lower() not in {"dry-run", "dry-run-limit"}
+        ]
+        okx_buy = sum(1 for row in okx_orders if row["side"] == "buy")
+        okx_sell = sum(1 for row in okx_orders if row["side"] == "sell")
+        ai_buy = sum(1 for row in ai_rows if row["intent"] == "buy" and row["action"] == "buy")
+        ai_sell = sum(1 for row in ai_rows if row["intent"] == "sell" and row["action"] == "sell")
+        rule_buy = sum(1 for row in rule_rows if row["side"] == "buy")
+        rule_sell = sum(1 for row in rule_rows if row["side"] == "sell")
+        filled = sum(1 for row in order_rows if row["status"] == "filled")
+        partial = sum(1 for row in order_rows if row["status"] == "partial")
+        pending = sum(1 for row in order_rows if row["status"] == "pending")
+        failed = sum(1 for row in order_rows if not row["ok"] or row["status"] in {"rejected", "canceled"})
+        lines = [
+            "真实执行:",
+            f"AI决策 buy/sell={ai_buy}/{ai_sell}; 规则合成 buy/sell={rule_buy}/{rule_sell}; OKX真实订单 buy/sell={okx_buy}/{okx_sell}",
+            f"订单状态 filled={filled}; partial={partial}; pending={pending}; failed/canceled={failed}",
+        ]
+        if recent_fills:
+            lines.append("最近成交:")
+            lines.extend(
+                f"- {r['symbol']} {r['side']} {r['status']} size={r['filled_size']:.8g} "
+                f"avg={r['avg_fill_price'] or 0:.8g} okx={r['exchange_order_id'] or '-'}"
+                for r in recent_fills
+            )
+        if recent_failures:
+            lines.append("最近失败:")
+            lines.extend(
+                f"- {r['symbol']} {r['side']} {r['status']}: {r['error'] or r['reason']}"
+                for r in recent_failures
+            )
+        if no_order_rows:
+            lines.append("最近未下单原因:")
+            lines.extend(
+                f"- {r['symbol']} {r['status']}: {r['error'] or r['reason']}"
+                for r in no_order_rows
+            )
+        return "\n".join(lines)
 
     def _upsert_experience_score(
         self,
@@ -1527,6 +2004,26 @@ def _state_from_raw(raw: dict) -> str:
         "rejected": "rejected",
     }
     return mapping.get(state, "")
+
+
+def _order_event_source(raw: dict) -> str:
+    if raw.get("dry_run"):
+        return "dry_run_order"
+    if raw.get("local_validation"):
+        return "local_validation"
+    return "okx_order"
+
+
+def _ai_bucket(intent: str, error: str) -> str:
+    if error:
+        lower = error.lower()
+        if "parse_failed" in lower:
+            return lower.split(":", 1)[0]
+        if "json" in lower:
+            if intent == "portfolio_training":
+                return "training_parse_failed"
+            return f"{intent}_parse_failed"
+    return intent
 
 
 def _position_from_row(row: sqlite3.Row) -> Position:

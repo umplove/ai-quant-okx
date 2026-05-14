@@ -145,6 +145,50 @@ class AiReviewerTests(unittest.TestCase):
         self.assertEqual(review.error, "timeout")
         self.assertEqual(review.retry_count, 1)
 
+    def test_market_regime_bad_json_is_repaired_once(self):
+        responses = [
+            "regime=震荡 confidence=0.7 reason=原始格式坏了",
+            '{"regime":"震荡","confidence":0.7,"reason":"修复成功"}',
+        ]
+
+        def opener(request, timeout):
+            return json.dumps({"choices": [{"message": {"content": responses.pop(0)}}]}, ensure_ascii=False).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = settings_for(Path(tmp) / "bot.sqlite3")
+            settings = settings.__class__(
+                **{
+                    **settings.__dict__,
+                    "ai_review_enabled": True,
+                    "openai_api_key": "secret-key",
+                    "ai_request_retries": 0,
+                }
+            )
+            regime = AiReviewClient(settings, opener=opener).decide_market_regime(_scan())
+
+        self.assertTrue(regime.ok)
+        self.assertEqual(regime.regime, "震荡")
+        self.assertEqual(regime.reason, "修复成功")
+
+    def test_training_bad_json_failure_is_classified(self):
+        def opener(request, timeout):
+            return json.dumps({"choices": [{"message": {"content": "不是JSON"}}]}, ensure_ascii=False).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = settings_for(Path(tmp) / "bot.sqlite3")
+            settings = settings.__class__(
+                **{
+                    **settings.__dict__,
+                    "ai_review_enabled": True,
+                    "openai_api_key": "secret-key",
+                    "ai_request_retries": 0,
+                }
+            )
+            decision = AiReviewClient(settings, opener=opener).complete_training("训练")
+
+        self.assertFalse(decision.ok)
+        self.assertIn("training_parse_failed", decision.error)
+
     def test_extracts_nested_output_text(self):
         payload = {"output": [{"content": [{"text": "第一段"}, {"text": "第二段"}]}]}
 
