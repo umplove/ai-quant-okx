@@ -40,6 +40,9 @@ class AiTrainingPool:
         self._queue: queue.Queue[TrainingTask] = queue.Queue(maxsize=2000)
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._dropped_tasks = 0
+        self._worker_errors = 0
+        self._lock = threading.Lock()
 
     def start(self) -> None:
         if self._threads or not (self.settings.ai_training_enabled and self.settings.ai_review_enabled):
@@ -48,6 +51,20 @@ class AiTrainingPool:
             thread = threading.Thread(target=self._worker, name=f"ai-training-{idx + 1}", daemon=True)
             thread.start()
             self._threads.append(thread)
+
+    def status(self) -> dict[str, int]:
+        with self._lock:
+            dropped = self._dropped_tasks
+            errors = self._worker_errors
+        alive = sum(1 for thread in self._threads if thread.is_alive())
+        return {
+            "configured_workers": int(self.settings.ai_training_workers),
+            "threads": len(self._threads),
+            "alive_threads": alive,
+            "queue_size": self._queue.qsize(),
+            "dropped_tasks": dropped,
+            "worker_errors": errors,
+        }
 
     def enqueue_scan(self, scan: MomentumScan, strategy_context: str) -> None:
         if not self._threads:
@@ -79,6 +96,8 @@ class AiTrainingPool:
         try:
             self._queue.put_nowait(task)
         except queue.Full:
+            with self._lock:
+                self._dropped_tasks += 1
             self.storage.set_state("ai_training_queue_full", str(int(time.time())))
 
     def _worker(self) -> None:
@@ -89,44 +108,53 @@ class AiTrainingPool:
             except queue.Empty:
                 continue
             try:
-                result = client.complete_training(task.prompt)
-                self.storage.save_ai_call_audit(
-                    symbol=task.symbol,
-                    intent=task.intent,
-                    ok=result.ok,
-                    action=result.action if result.ok else "hold",
-                    confidence=float(result.confidence),
-                    prompt_chars=result.prompt_chars,
-                    response_chars=result.response_chars,
-                    duration_ms=result.duration_ms,
-                    error="" if result.ok else result.error,
-                    reason=result.reason if result.ok else result.error,
-                    prompt_tokens=result.prompt_tokens,
-                    completion_tokens=result.completion_tokens,
-                    total_tokens=result.total_tokens,
-                    retry_count=result.retry_count,
-                )
-                self.storage.add_training_usage(
-                    week_key=current_week_key(),
-                    target_tokens=self.settings.ai_weekly_token_target,
-                    prompt_tokens=result.prompt_tokens,
-                    completion_tokens=result.completion_tokens,
-                    total_tokens=result.total_tokens,
-                    ok=result.ok,
-                )
-                if task.intent == "shadow" and result.ok:
-                    decision = _parse_trade_decision(result.raw_text)
-                    self.storage.save_shadow_decision(
-                        task.symbol,
-                        task.market_type,
-                        task.strategy,
-                        decision.action,
-                        decision.confidence,
-                        decision.reason,
-                        result.raw_text,
-                    )
+                self._handle_task(client, task)
+            except Exception as exc:
+                with self._lock:
+                    self._worker_errors += 1
+                self.storage.save_bot_error("ai_training_worker", "训练线程异常，已继续运行", str(exc))
             finally:
                 self._queue.task_done()
+
+    def _handle_task(self, client: AiReviewClient, task: TrainingTask) -> None:
+        result = client.complete_training(task.prompt)
+        self.storage.save_ai_call_audit(
+            symbol=task.symbol,
+            intent=task.intent,
+            ok=result.ok,
+            action=result.action if result.ok else "hold",
+            confidence=float(result.confidence),
+            prompt_chars=result.prompt_chars,
+            response_chars=result.response_chars,
+            duration_ms=result.duration_ms,
+            error="" if result.ok else result.error,
+            reason=result.reason if result.ok else result.error,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            attempted_tokens=result.attempted_tokens,
+            retry_count=result.retry_count,
+        )
+        self.storage.add_training_usage(
+            week_key=current_week_key(),
+            target_tokens=self.settings.ai_weekly_token_target,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            attempted_tokens=result.attempted_tokens,
+            ok=result.ok,
+        )
+        if task.intent == "shadow" and result.ok:
+            decision = _parse_trade_decision(result.raw_text)
+            self.storage.save_shadow_decision(
+                task.symbol,
+                task.market_type,
+                task.strategy,
+                decision.action,
+                decision.confidence,
+                decision.reason,
+                result.raw_text,
+            )
 
 
 def current_week_key() -> str:

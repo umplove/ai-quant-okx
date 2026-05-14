@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import URLError
 
 from okx_quant_bot.data import Storage
 from okx_quant_bot.notify import Notifier
@@ -47,14 +48,31 @@ class NotifyControlsTests(unittest.TestCase):
                     {"update_id": 14, "message": {"text": "/ai", "chat": {"id": 123}}},
                     {"update_id": 15, "message": {"text": "/positions", "chat": {"id": 123}}},
                     {"update_id": 16, "message": {"text": "/training", "chat": {"id": 123}}},
+                    {"update_id": 17, "message": {"text": "/health", "chat": {"id": 123}}},
+                    {"update_id": 18, "message": {"text": "/errors", "chat": {"id": 123}}},
+                    {"update_id": 19, "message": {"text": "/shadow", "chat": {"id": 123}}},
                 ]
             }
             with patch("urllib.request.urlopen", return_value=_Response(payload)):
                 actions = Notifier(settings).poll_controls(storage)
 
-            self.assertEqual(actions, ["stopped", "started", "reset", "status", "ai", "positions", "training"])
+            self.assertEqual(
+                actions,
+                [
+                    "stopped",
+                    "started",
+                    "reset",
+                    "status",
+                    "ai",
+                    "positions",
+                    "training",
+                    "health",
+                    "errors",
+                    "shadow",
+                ],
+            )
             self.assertEqual(storage.get_state("bot_paused"), "0")
-            self.assertEqual(storage.get_state("telegram_update_offset"), "17")
+            self.assertEqual(storage.get_state("telegram_update_offset"), "20")
 
     def test_setup_commands_registers_function_panel(self):
         captured = {}
@@ -78,8 +96,26 @@ class NotifyControlsTests(unittest.TestCase):
                 Notifier(settings).setup_commands()
 
         self.assertIn("/bot", captured["url"])
-        for command in ("status", "ai", "positions", "training", "stop", "start", "reset"):
+        for command in ("status", "ai", "positions", "training", "health", "errors", "shadow", "stop", "start", "reset"):
             self.assertIn(command, captured["body"])
+
+    def test_send_failure_is_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = settings_for(Path(tmp) / "bot.sqlite3")
+            settings = settings.__class__(
+                **{
+                    **settings.__dict__,
+                    "telegram_bot_token": "token",
+                    "telegram_chat_id": "123",
+                }
+            )
+            notifier = Notifier(settings)
+
+            with patch("urllib.request.urlopen", side_effect=URLError("timeout")):
+                ok = notifier.send("hello")
+
+        self.assertFalse(ok)
+        self.assertIn("timeout", notifier.last_error)
 
 
 if __name__ == "__main__":

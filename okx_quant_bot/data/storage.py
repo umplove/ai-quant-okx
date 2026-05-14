@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
@@ -26,8 +27,11 @@ class Storage:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
     def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute("pragma busy_timeout = 30000")
+        conn.execute("pragma journal_mode = WAL")
+        conn.execute("pragma synchronous = NORMAL")
         return conn
 
     @contextmanager
@@ -35,7 +39,15 @@ class Storage:
         conn = self.connect()
         try:
             yield conn
-            conn.commit()
+            for attempt in range(3):
+                try:
+                    conn.commit()
+                    break
+                except sqlite3.OperationalError as exc:
+                    conn.rollback()
+                    if "locked" not in str(exc).lower() or attempt >= 2:
+                        raise
+                    time.sleep(0.2 * (attempt + 1))
         finally:
             conn.close()
 
@@ -215,6 +227,7 @@ class Storage:
                     prompt_tokens integer not null default 0,
                     completion_tokens integer not null default 0,
                     total_tokens integer not null default 0,
+                    attempted_tokens integer not null default 0,
                     retry_count integer not null default 0,
                     created_at text default current_timestamp
                 );
@@ -225,6 +238,7 @@ class Storage:
                     prompt_tokens integer not null default 0,
                     completion_tokens integer not null default 0,
                     total_tokens integer not null default 0,
+                    attempted_tokens integer not null default 0,
                     task_count integer not null default 0,
                     success_count integer not null default 0,
                     error_count integer not null default 0,
@@ -242,12 +256,28 @@ class Storage:
                     raw text not null,
                     created_at text default current_timestamp
                 );
+
+                create table if not exists bot_errors (
+                    id integer primary key autoincrement,
+                    source text not null,
+                    message text not null,
+                    details text not null,
+                    created_at text default current_timestamp
+                );
+
+                create table if not exists config_snapshots (
+                    id integer primary key autoincrement,
+                    snapshot text not null,
+                    created_at text default current_timestamp
+                );
                 """
             )
             self._ensure_column(conn, "ai_call_audits", "prompt_tokens", "integer not null default 0")
             self._ensure_column(conn, "ai_call_audits", "completion_tokens", "integer not null default 0")
             self._ensure_column(conn, "ai_call_audits", "total_tokens", "integer not null default 0")
+            self._ensure_column(conn, "ai_call_audits", "attempted_tokens", "integer not null default 0")
             self._ensure_column(conn, "ai_call_audits", "retry_count", "integer not null default 0")
+            self._ensure_column(conn, "ai_training_runs", "attempted_tokens", "integer not null default 0")
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -622,6 +652,7 @@ class Storage:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: int = 0,
+        attempted_tokens: int = 0,
         retry_count: int = 0,
     ) -> None:
         with self.session() as conn:
@@ -630,8 +661,8 @@ class Storage:
                 insert into ai_call_audits(
                     symbol, intent, ok, action, confidence, prompt_chars, response_chars,
                     duration_ms, error, reason, prompt_tokens, completion_tokens,
-                    total_tokens, retry_count
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    total_tokens, attempted_tokens, retry_count
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol,
@@ -647,6 +678,7 @@ class Storage:
                     int(prompt_tokens),
                     int(completion_tokens),
                     int(total_tokens),
+                    int(attempted_tokens or total_tokens or max(0, int(prompt_chars) // 2)),
                     int(retry_count),
                 ),
             )
@@ -656,7 +688,7 @@ class Storage:
             rows = conn.execute(
                 """
                 select intent, ok, action, prompt_chars, response_chars, duration_ms, error,
-                       prompt_tokens, completion_tokens, total_tokens, retry_count
+                       prompt_tokens, completion_tokens, total_tokens, attempted_tokens, retry_count
                 from ai_call_audits
                 order by created_at desc, id desc
                 limit ?
@@ -672,13 +704,15 @@ class Storage:
         prompt_chars = sum(int(row["prompt_chars"]) for row in rows)
         response_chars = sum(int(row["response_chars"]) for row in rows)
         total_tokens = sum(int(row["total_tokens"]) for row in rows)
+        attempted_tokens = sum(int(row["attempted_tokens"]) for row in rows)
         retry_count = sum(int(row["retry_count"]) for row in rows)
         avg_ms = sum(int(row["duration_ms"]) for row in rows) / total
         errors = [str(row["error"]) for row in rows if row["error"]]
         error_tail = f"; 最近错误: {errors[0][:60]}" if errors else ""
         return (
             f"AI调用: {ok_count}/{total}成功; buy={buy_count}; sell={sell_count}; "
-            f"输入约{prompt_chars}字; 输出约{response_chars}字; token={total_tokens}; "
+            f"输入约{prompt_chars}字; 输出约{response_chars}字; 成功token={total_tokens}; "
+            f"估算尝试token={attempted_tokens}; "
             f"重试={retry_count}; 平均{avg_ms:.0f}ms"
             f"{error_tail}"
         )
@@ -690,20 +724,25 @@ class Storage:
         prompt_tokens: int,
         completion_tokens: int,
         total_tokens: int,
-        ok: bool,
+        attempted_tokens: int | bool = 0,
+        ok: bool | None = None,
     ) -> None:
+        if ok is None:
+            ok = bool(attempted_tokens)
+            attempted_tokens = total_tokens
         with self.session() as conn:
             conn.execute(
                 """
                 insert into ai_training_runs(
                     week_key, target_tokens, prompt_tokens, completion_tokens,
-                    total_tokens, task_count, success_count, error_count
-                ) values (?, ?, ?, ?, ?, 1, ?, ?)
+                    total_tokens, attempted_tokens, task_count, success_count, error_count
+                ) values (?, ?, ?, ?, ?, ?, 1, ?, ?)
                 on conflict(week_key) do update set
                     target_tokens = excluded.target_tokens,
                     prompt_tokens = ai_training_runs.prompt_tokens + excluded.prompt_tokens,
                     completion_tokens = ai_training_runs.completion_tokens + excluded.completion_tokens,
                     total_tokens = ai_training_runs.total_tokens + excluded.total_tokens,
+                    attempted_tokens = ai_training_runs.attempted_tokens + excluded.attempted_tokens,
                     task_count = ai_training_runs.task_count + 1,
                     success_count = ai_training_runs.success_count + excluded.success_count,
                     error_count = ai_training_runs.error_count + excluded.error_count,
@@ -715,6 +754,7 @@ class Storage:
                     int(prompt_tokens),
                     int(completion_tokens),
                     int(total_tokens),
+                    int(attempted_tokens or total_tokens or 0),
                     int(ok),
                     0 if ok else 1,
                 ),
@@ -724,11 +764,12 @@ class Storage:
         with self.session() as conn:
             row = conn.execute("select * from ai_training_runs where week_key = ?", (week_key,)).fetchone()
         if row is None:
-            return f"训练进度: 0/{target_tokens} token，完成率0.00%，任务0，成功0，失败0"
+            return f"训练进度: 成功0/{target_tokens} token，估算尝试0，完成率0.00%，任务0，成功0，失败0"
         total_tokens = int(row["total_tokens"])
+        attempted_tokens = int(row["attempted_tokens"])
         pct = 0.0 if target_tokens <= 0 else total_tokens / target_tokens * 100.0
         return (
-            f"训练进度: {total_tokens}/{target_tokens} token，完成率{pct:.2f}%，"
+            f"训练进度: 成功{total_tokens}/{target_tokens} token，估算尝试{attempted_tokens}，完成率{pct:.2f}%，"
             f"任务{row['task_count']}，成功{row['success_count']}，失败{row['error_count']}"
         )
 
@@ -782,6 +823,48 @@ class Storage:
             f"{r['symbol']} {r['intent']} -> {r['action']} conf={r['confidence']:.2f}: {r['reason']}"
             for r in rows
         ]
+
+    def latest_ai_decision(self, symbol: str, intent: str, max_age_seconds: int = 180) -> dict | None:
+        with self.session() as conn:
+            row = conn.execute(
+                """
+                select symbol, intent, action, confidence, reason, raw, created_at
+                from ai_decisions
+                where symbol = ? and intent = ? and created_at >= datetime('now', ?)
+                order by created_at desc, id desc
+                limit 1
+                """,
+                (symbol, intent, f"-{int(max_age_seconds)} seconds"),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def save_bot_error(self, source: str, message: str, details: str = "") -> None:
+        with self.session() as conn:
+            conn.execute(
+                "insert into bot_errors(source, message, details) values (?, ?, ?)",
+                (source[:100], message[:1000], details[:4000]),
+            )
+
+    def recent_bot_errors(self, limit: int = 10) -> list[str]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select source, message, details, created_at
+                from bot_errors
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            f"{r['created_at']} [{r['source']}] {r['message']}"
+            + (f" | {r['details'][:120]}" if r["details"] else "")
+            for r in rows
+        ]
+
+    def save_config_snapshot(self, snapshot: str) -> None:
+        with self.session() as conn:
+            conn.execute("insert into config_snapshots(snapshot) values (?)", (snapshot[:4000],))
 
     def symbol_experience_biases(self, limit: int = 200) -> dict[str, float]:
         with self.session() as conn:

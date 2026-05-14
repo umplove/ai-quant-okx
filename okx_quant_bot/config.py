@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +40,20 @@ def load_dotenv(path: str | Path = ".env") -> None:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand_env_value(value: str) -> str:
+    return _ENV_REF.sub(lambda match: os.getenv(match.group(1), ""), value)
+
+
+def _env(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return _expand_env_value(value)
 
 
 @dataclass(frozen=True)
@@ -114,9 +129,9 @@ class Settings:
             if s.strip()
         )
         return cls(
-            okx_api_key=os.getenv("OKX_API_KEY", ""),
-            okx_secret_key=os.getenv("OKX_SECRET_KEY", ""),
-            okx_passphrase=os.getenv("OKX_PASSPHRASE", ""),
+            okx_api_key=_env("OKX_API_KEY"),
+            okx_secret_key=_env("OKX_SECRET_KEY"),
+            okx_passphrase=_env("OKX_PASSPHRASE"),
             okx_demo=_bool(os.getenv("OKX_DEMO"), True),
             okx_base_url=os.getenv("OKX_BASE_URL", "https://www.okx.com").rstrip("/"),
             simulated_trading_header=_bool(os.getenv("OKX_SIMULATED_TRADING_HEADER"), True),
@@ -159,10 +174,10 @@ class Settings:
             telegram_controls_enabled=_bool(os.getenv("TELEGRAM_CONTROLS_ENABLED"), True),
             telegram_auto_reports=_bool(os.getenv("TELEGRAM_AUTO_REPORTS"), False),
             money_report_interval_scans=_int("MONEY_REPORT_INTERVAL_SCANS", 1),
-            openai_api_key=os.getenv("OPENAI_API_KEY") or os.getenv("MIMO_API_KEY", ""),
-            openai_model=os.getenv("OPENAI_MODEL", "mimo-v2.5-pro"),
-            openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.xiaomimimo.com/v1").rstrip("/"),
-            openai_api_mode=os.getenv("OPENAI_API_MODE", "chat").strip().lower(),
+            openai_api_key=_env("OPENAI_API_KEY") or _env("MIMO_API_KEY"),
+            openai_model=_env("OPENAI_MODEL", "mimo-v2.5-pro"),
+            openai_base_url=_env("OPENAI_BASE_URL", "https://api.xiaomimimo.com/v1").rstrip("/"),
+            openai_api_mode=_env("OPENAI_API_MODE", "chat").strip().lower(),
             ai_review_max_tokens=_int("AI_REVIEW_MAX_TOKENS", 2000),
             ai_review_timeout_seconds=_float("AI_REVIEW_TIMEOUT_SECONDS", 12.0),
             ai_review_enabled=_bool(os.getenv("AI_REVIEW_ENABLED"), False),
@@ -220,8 +235,10 @@ class Settings:
     def ai_config_warning(self) -> str:
         model = self.openai_model.lower()
         base = self.openai_base_url.lower()
+        if self.ai_review_enabled and (not self.openai_api_key or self.openai_api_key.startswith("${")):
+            return "OPENAI_API_KEY 不是有效 key，请直接填小米 key，或设置 MIMO_API_KEY 后写 OPENAI_API_KEY=${MIMO_API_KEY}。"
         if "mimo" in model and not (self.openai_api_mode == "chat" and base == "https://api.xiaomimimo.com/v1"):
-            return "MiMo模型建议配置为 OPENAI_API_MODE=chat 且 OPENAI_BASE_URL=https://api.xiaomimimo.com/v1"
+            return "MiMo 模型建议配置为 OPENAI_API_MODE=chat 且 OPENAI_BASE_URL=https://api.xiaomimimo.com/v1。"
         if model.startswith("gpt-") and "xiaomimimo" in base:
-            return "OpenAI官方模型不应使用小米Base URL，请改用MiMo模型或切回OpenAI官方Base URL"
+            return "OpenAI 官方模型不应使用小米 Base URL，请改用 MiMo 模型或切回 OpenAI 官方 Base URL。"
         return ""

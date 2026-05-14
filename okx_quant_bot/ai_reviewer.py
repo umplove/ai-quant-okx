@@ -23,6 +23,7 @@ class AiReview:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    attempted_tokens: int = 0
     retry_count: int = 0
 
 
@@ -40,6 +41,7 @@ class AiTradeDecision:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    attempted_tokens: int = 0
     retry_count: int = 0
 
     @property
@@ -71,7 +73,7 @@ class AiReviewClient:
         strategy_memory: str = "",
     ) -> AiReview:
         if not self.enabled:
-            return AiReview(False, "", "AI未启用或缺少OPENAI_API_KEY/MIMO_API_KEY。")
+            return AiReview(False, "", "AI未启用或缺少 OPENAI_API_KEY/MIMO_API_KEY。")
         prompt = _scan_prompt(self.settings, scan, open_position_count, strategy_memory)
         result = self._complete(prompt)
         return AiReview(
@@ -84,6 +86,7 @@ class AiReviewClient:
             prompt_tokens=result.prompt_tokens,
             completion_tokens=result.completion_tokens,
             total_tokens=result.total_tokens,
+            attempted_tokens=result.attempted_tokens,
             retry_count=result.retry_count,
         )
 
@@ -128,12 +131,18 @@ class AiReviewClient:
             prompt_tokens=result.prompt_tokens,
             completion_tokens=result.completion_tokens,
             total_tokens=result.total_tokens,
+            attempted_tokens=result.attempted_tokens,
             retry_count=result.retry_count,
         )
 
     def _complete(self, prompt: str) -> AiTradeDecision:
         if not self.enabled:
-            return AiTradeDecision(False, error="AI未启用或缺少OPENAI_API_KEY/MIMO_API_KEY。", prompt_chars=len(prompt))
+            return AiTradeDecision(
+                False,
+                error="AI未启用或缺少 OPENAI_API_KEY/MIMO_API_KEY。",
+                prompt_chars=len(prompt),
+                attempted_tokens=_estimate_tokens(prompt),
+            )
         body = self._request_body(prompt)
         request = urllib.request.Request(
             self._request_url(),
@@ -151,7 +160,7 @@ class AiReviewClient:
                 text = _extract_ai_text(payload).strip()
                 usage = _extract_usage(payload)
                 if not text:
-                    raise ValueError("AI响应没有正文。")
+                    raise ValueError("AI 响应没有正文。")
                 return AiTradeDecision(
                     True,
                     raw_text=text,
@@ -161,6 +170,7 @@ class AiReviewClient:
                     prompt_tokens=usage["prompt_tokens"],
                     completion_tokens=usage["completion_tokens"],
                     total_tokens=usage["total_tokens"],
+                    attempted_tokens=usage["total_tokens"] or _estimate_tokens(prompt),
                     retry_count=attempt,
                 )
             except urllib.error.HTTPError as exc:
@@ -180,6 +190,7 @@ class AiReviewClient:
             error=last_error,
             prompt_chars=len(prompt),
             duration_ms=int((time.monotonic() - started) * 1000),
+            attempted_tokens=_estimate_tokens(prompt) * attempts,
             retry_count=max(0, attempts - 1),
         )
 
@@ -353,7 +364,7 @@ def _parse_trade_decision(text: str) -> AiTradeDecision:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        return AiTradeDecision(False, raw_text=raw_text, error="AI决策JSON解析失败。")
+        return AiTradeDecision(False, raw_text=raw_text, error="AI 决策 JSON 解析失败。")
     action = str(payload.get("action") or "hold").strip().lower()
     if action not in {"buy", "hold", "sell"}:
         action = "hold"
@@ -437,6 +448,10 @@ def _extract_usage(payload: dict) -> dict[str, int]:
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
     }
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, int(len(text) / 1.8))
 
 
 def _telegram_sized(text: str, limit: int = 3500) -> str:
