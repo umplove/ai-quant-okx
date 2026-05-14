@@ -37,6 +37,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("run")
     sub.add_parser("scan-momentum")
     sub.add_parser("run-momentum")
+    sub.add_parser("telegram-diagnose")
 
     args = parser.parse_args(argv)
     settings = Settings.from_env()
@@ -120,6 +121,32 @@ def main(argv: list[str] | None = None) -> int:
             notifier=Notifier(settings),
         )
         runner.run_forever()
+        return 0
+
+    if args.command == "telegram-diagnose":
+        storage.init()
+        notifier = Notifier(settings)
+        actions = notifier.poll_controls(storage)
+        token_state = "set" if settings.telegram_bot_token else "missing"
+        chat_state = "set" if settings.telegram_chat_id else "missing"
+        print("Telegram diagnose")
+        print(f"token={token_state}; chat_id={chat_state}; controls_enabled={settings.telegram_controls_enabled}")
+        print(f"actions={actions}")
+        for key in (
+            "telegram_poll_status",
+            "telegram_poll_started_at",
+            "telegram_poll_finished_at",
+            "telegram_update_offset",
+            "telegram_last_update_count",
+            "telegram_last_update_id",
+            "telegram_last_update_text",
+            "telegram_last_update_chat_id",
+            "telegram_last_update_ignored_reason",
+        ):
+            print(f"{key}={storage.get_state(key, '')}")
+        if notifier.last_error:
+            print(f"last_error={notifier.last_error}")
+            return 1
         return 0
 
     parser.error("unknown command")

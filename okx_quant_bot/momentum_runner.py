@@ -1374,7 +1374,7 @@ class MomentumBotRunner:
         )
         self._controls_thread.start()
         self.storage.set_state("telegram_control_thread", "running")
-        print("Telegram control thread started")
+        print("Telegram control thread started", flush=True)
 
     def _control_thread_loop(self) -> None:
         while not self._controls_stop.is_set():

@@ -80,6 +80,7 @@ class Notifier:
             return actions
         except Exception as exc:
             self.last_error = str(exc)
+            print(f"Telegram poll failed: {exc}", flush=True)
             try:
                 storage.set_state("telegram_poll_status", f"error: {str(exc)[:200]}")
                 storage.set_state("telegram_poll_finished_at", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
