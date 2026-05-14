@@ -11,6 +11,7 @@ from okx_quant_bot.models import CandidateScore, OrderResult, Position, Side, St
 from okx_quant_bot.momentum import MomentumScan, run_momentum_scan, stop_loss_plan, target_position_usdt, utc_day
 from okx_quant_bot.notify import Notifier
 from okx_quant_bot.trade_review import TradeReviewEngine
+from okx_quant_bot.training import AiTrainingPool, current_week_key
 
 
 @dataclass
@@ -19,6 +20,7 @@ class MomentumBotRunner:
     storage: Storage
     exchange: OkxRestClient
     notifier: Notifier
+    training_pool: AiTrainingPool | None = None
 
     def run_forever(self) -> None:
         self.settings.require_safe_trading_config()
@@ -27,8 +29,11 @@ class MomentumBotRunner:
             self.notifier.setup_commands()
         except Exception:
             pass
+        if self.training_pool is None:
+            self.training_pool = AiTrainingPool(self.settings, self.storage)
+        self.training_pool.start()
         self._send_startup_diagnostics()
-        self._send_money_report()
+        self._send_money_report(force=True)
 
         while True:
             try:
@@ -36,7 +41,7 @@ class MomentumBotRunner:
                 if not self._is_paused():
                     self.run_once()
             except Exception:
-                self._send_money_report()
+                self.notifier.send("主循环异常，机器人会继续运行并等待下一轮。")
             time.sleep(self.settings.scan_interval_seconds)
 
     def run_once(self) -> MomentumScan:
@@ -56,6 +61,8 @@ class MomentumBotRunner:
             if decision.approved_buy and self._is_tradable_candidate(candidate):
                 self._buy_and_protect(candidate)
 
+        if self.training_pool is not None:
+            self.training_pool.enqueue_scan(scan, self._strategy_context())
         self._send_money_report(scan=scan, ai_note=ai_note)
         return scan
 
@@ -163,6 +170,10 @@ class MomentumBotRunner:
             duration_ms=int(getattr(decision, "duration_ms", 0)),
             error="" if decision.ok else decision.error,
             reason=decision.reason if decision.ok else decision.error,
+            prompt_tokens=int(getattr(decision, "prompt_tokens", 0)),
+            completion_tokens=int(getattr(decision, "completion_tokens", 0)),
+            total_tokens=int(getattr(decision, "total_tokens", 0)),
+            retry_count=int(getattr(decision, "retry_count", 0)),
         )
 
     def _strategy_context(self) -> str:
@@ -327,6 +338,10 @@ class MomentumBotRunner:
             duration_ms=review.duration_ms,
             error="" if review.ok else review.error,
             reason=review.text if review.ok else review.error,
+            prompt_tokens=review.prompt_tokens,
+            completion_tokens=review.completion_tokens,
+            total_tokens=review.total_tokens,
+            retry_count=review.retry_count,
         )
         if review.ok:
             return review.text
@@ -351,7 +366,10 @@ class MomentumBotRunner:
         scan: MomentumScan | None = None,
         ai_note: str = "",
         note: str = "",
+        force: bool = False,
     ) -> None:
+        if not force and not self.settings.telegram_auto_reports:
+            return
         count = int(self.storage.get_state("money_report_scan_count", "0") or "0") + 1
         self.storage.set_state("money_report_scan_count", str(count))
         if scan is not None and count % self.settings.money_report_interval_scans != 0:
@@ -417,26 +435,68 @@ class MomentumBotRunner:
     def _handle_controls(self) -> None:
         for action in self.notifier.poll_controls(self.storage):
             if action in {"stopped", "started", "reset", "status"}:
-                self._send_money_report()
+                self._send_money_report(force=True)
+            elif action == "ai":
+                self.notifier.send(self._ai_status_message())
+            elif action == "positions":
+                self.notifier.send(self._positions_message())
+            elif action == "training":
+                self.notifier.send(self._training_message())
 
     def _is_paused(self) -> bool:
         return self.storage.get_state("bot_paused", "0") == "1"
 
     def _send_startup_diagnostics(self) -> None:
-        mode = "demo" if self.settings.okx_demo else "live"
-        trading = "on" if self.settings.trading_enabled else "off"
-        ai = "on" if self.settings.ai_review_enabled else "off"
-        cadence = "every scan" if self.settings.ai_always_on else f"every {self.settings.ai_review_interval_scans} scans"
+        mode = "模拟盘" if self.settings.okx_demo else "实盘"
+        trading = "开启" if self.settings.trading_enabled else "关闭"
+        ai = "开启" if self.settings.ai_review_enabled else "关闭"
+        cadence = "每轮工作" if self.settings.ai_always_on else f"每{self.settings.ai_review_interval_scans}轮"
+        warning = self.settings.ai_config_warning()
         self.notifier.send_money(
             "\n".join(
                 [
-                    f"Startup: mode={mode}; trading={trading}; ai={ai}; ai_cadence={cadence}",
-                    f"positions={self.settings.max_open_positions}; scan={self.settings.scan_interval_seconds}s",
-                    f"ai_candidates=top {self.settings.ai_review_max_candidates}; exploration={self.settings.ai_exploration_fraction:.0%}",
-                    f"risk_halt={'on' if self.settings.risk_halt_enabled else 'off'}; okx_skill_sources={len(self.settings.okx_skill_signal_urls)}",
+                    f"启动诊断: 模式={mode}; 下单={trading}; AI={ai}; AI节奏={cadence}",
+                    f"持仓上限={self.settings.max_open_positions}; 扫描间隔={self.settings.scan_interval_seconds}s",
+                    f"AI候选=top {self.settings.ai_review_max_candidates}; 探索比例={self.settings.ai_exploration_fraction:.0%}",
+                    f"风险熔断={'开启' if self.settings.risk_halt_enabled else '关闭'}; OKX技能信号源={len(self.settings.okx_skill_signal_urls)}",
+                    f"AI配置提醒: {warning or '正常'}",
                 ]
             )
         )
+
+    def _ai_status_message(self) -> str:
+        warning = self.settings.ai_config_warning()
+        return "\n".join(
+            [
+                f"AI配置: 模型={self.settings.openai_model}",
+                f"Base URL={self.settings.openai_base_url}",
+                f"协议={self.settings.openai_api_mode}; 超时={self.settings.ai_review_timeout_seconds}s; 重试={self.settings.ai_request_retries}",
+                f"训练线程={self.settings.ai_training_workers}; 周目标={self.settings.ai_weekly_token_target} token",
+                f"配置自检: {warning or '正常'}",
+                self.storage.recent_ai_call_summary(),
+            ]
+        )
+
+    def _positions_message(self) -> str:
+        positions = self.storage.open_positions()
+        if not positions:
+            return "当前没有持仓。"
+        lines = ["当前持仓:"]
+        for position in positions:
+            lines.append(
+                f"- {position.symbol}: 数量{position.base_qty:.8g}, 成本{position.avg_entry_price:.8g}, 最高{position.highest_price:.8g}"
+            )
+        decisions = self.storage.recent_ai_decisions(limit=6)
+        if decisions:
+            lines.extend(["最近AI意见:", *decisions])
+        return "\n".join(lines)
+
+    def _training_message(self) -> str:
+        lines = [self.storage.training_summary(current_week_key(), self.settings.ai_weekly_token_target)]
+        shadows = self.storage.recent_shadow_decisions(limit=6)
+        if shadows:
+            lines.extend(["最近影子决策:", *shadows])
+        return "\n".join(lines)
 
 
 def _filled_price(result: OrderResult) -> float | None:

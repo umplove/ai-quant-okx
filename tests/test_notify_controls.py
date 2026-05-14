@@ -44,14 +44,17 @@ class NotifyControlsTests(unittest.TestCase):
                     {"update_id": 11, "message": {"text": "/start", "chat": {"id": 123}}},
                     {"update_id": 12, "message": {"text": "/reset", "chat": {"id": 123}}},
                     {"update_id": 13, "message": {"text": "/status", "chat": {"id": 123}}},
+                    {"update_id": 14, "message": {"text": "/ai", "chat": {"id": 123}}},
+                    {"update_id": 15, "message": {"text": "/positions", "chat": {"id": 123}}},
+                    {"update_id": 16, "message": {"text": "/training", "chat": {"id": 123}}},
                 ]
             }
             with patch("urllib.request.urlopen", return_value=_Response(payload)):
                 actions = Notifier(settings).poll_controls(storage)
 
-            self.assertEqual(actions, ["stopped", "started", "reset", "status"])
+            self.assertEqual(actions, ["stopped", "started", "reset", "status", "ai", "positions", "training"])
             self.assertEqual(storage.get_state("bot_paused"), "0")
-            self.assertEqual(storage.get_state("telegram_update_offset"), "14")
+            self.assertEqual(storage.get_state("telegram_update_offset"), "17")
 
     def test_setup_commands_registers_function_panel(self):
         captured = {}
@@ -75,7 +78,7 @@ class NotifyControlsTests(unittest.TestCase):
                 Notifier(settings).setup_commands()
 
         self.assertIn("/bot", captured["url"])
-        for command in ("status", "stop", "start", "reset"):
+        for command in ("status", "ai", "positions", "training", "stop", "start", "reset"):
             self.assertIn(command, captured["body"])
 
 

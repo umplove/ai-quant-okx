@@ -75,12 +75,30 @@ class BacktestStorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "bot.sqlite3")
             storage.init()
-            storage.save_ai_call_audit("BTC-USDT", "buy", True, "buy", 0.9, 1000, 80, 250, "", "ok")
+            storage.save_ai_call_audit(
+                "BTC-USDT", "buy", True, "buy", 0.9, 1000, 80, 250, "", "ok",
+                prompt_tokens=100, completion_tokens=20, total_tokens=120, retry_count=1,
+            )
 
             summary = storage.recent_ai_call_summary()
 
         self.assertIn("1/1", summary)
         self.assertIn("buy=1", summary)
+        self.assertIn("token=120", summary)
+
+    def test_training_and_shadow_summaries_are_saved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "bot.sqlite3")
+            storage.init()
+            storage.add_training_usage("2026-W20", 1_000_000_000, 100, 20, 120, True)
+            storage.save_shadow_decision("BTC-USDT", "swap", "永续合约影子判断", "hold", 0.8, "风险一般")
+
+            training = storage.training_summary("2026-W20", 1_000_000_000)
+            shadows = storage.recent_shadow_decisions()
+
+        self.assertIn("120/1000000000", training)
+        self.assertIn("BTC-USDT", shadows[0])
+        self.assertIn("swap", shadows[0])
 
 
 if __name__ == "__main__":

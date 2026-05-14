@@ -247,6 +247,33 @@ class MomentumRunnerTests(unittest.TestCase):
             self.assertEqual(storage.get_state("paused:AAA-USDT", ""), "")
             self.assertTrue(storage.get_position("AAA-USDT").is_open)
 
+    def test_money_report_is_manual_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            settings = settings_for(db)
+            notifier = _Notifier()
+            runner = MomentumBotRunner(settings, storage, _Exchange(), notifier)
+
+            runner._send_money_report()
+            self.assertEqual(notifier.messages, [])
+
+            runner._send_money_report(force=True)
+            self.assertEqual(len(notifier.messages), 1)
+            self.assertIn("总资产", notifier.messages[0])
+
+    def test_manual_ai_and_training_messages_are_chinese(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            settings = settings_for(db)
+            runner = MomentumBotRunner(settings, storage, _Exchange(), _Notifier())
+
+            self.assertIn("AI配置", runner._ai_status_message())
+            self.assertIn("训练进度", runner._training_message())
+
 
 def _candidate(symbol: str, confirmed: bool = True) -> CandidateScore:
     return CandidateScore(

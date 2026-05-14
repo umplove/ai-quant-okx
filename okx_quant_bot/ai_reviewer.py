@@ -20,6 +20,10 @@ class AiReview:
     prompt_chars: int = 0
     response_chars: int = 0
     duration_ms: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    retry_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,10 @@ class AiTradeDecision:
     prompt_chars: int = 0
     response_chars: int = 0
     duration_ms: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    retry_count: int = 0
 
     @property
     def approved_buy(self) -> bool:
@@ -63,18 +71,20 @@ class AiReviewClient:
         strategy_memory: str = "",
     ) -> AiReview:
         if not self.enabled:
-            return AiReview(False, "", "AI review is disabled or OPENAI_API_KEY is missing.")
+            return AiReview(False, "", "AI未启用或缺少OPENAI_API_KEY/MIMO_API_KEY。")
         prompt = _scan_prompt(self.settings, scan, open_position_count, strategy_memory)
         result = self._complete(prompt)
-        if not result.ok:
-            return AiReview(False, "", result.error, result.prompt_chars, result.response_chars, result.duration_ms)
         return AiReview(
-            True,
-            _telegram_sized(result.raw_text),
-            "",
-            result.prompt_chars,
-            result.response_chars,
-            result.duration_ms,
+            ok=result.ok,
+            text=_telegram_sized(result.raw_text) if result.ok else "",
+            error="" if result.ok else result.error,
+            prompt_chars=result.prompt_chars,
+            response_chars=result.response_chars,
+            duration_ms=result.duration_ms,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            retry_count=result.retry_count,
         )
 
     def decide_buy(
@@ -97,26 +107,33 @@ class AiReviewClient:
         prompt = _sell_prompt(self.settings, scan, position, current_price, strategy_memory)
         return self._decide(prompt)
 
+    def complete_training(self, prompt: str) -> AiTradeDecision:
+        return self._complete(prompt)
+
     def _decide(self, prompt: str) -> AiTradeDecision:
         result = self._complete(prompt)
         if not result.ok:
-            return AiTradeDecision(False, error=result.error)
+            return result
         parsed = _parse_trade_decision(result.raw_text)
         return AiTradeDecision(
-            parsed.ok,
-            parsed.action,
-            parsed.confidence,
-            parsed.reason,
-            parsed.raw_text,
-            parsed.error,
-            result.prompt_chars,
-            result.response_chars,
-            result.duration_ms,
+            ok=parsed.ok,
+            action=parsed.action,
+            confidence=parsed.confidence,
+            reason=parsed.reason,
+            raw_text=parsed.raw_text,
+            error=parsed.error,
+            prompt_chars=result.prompt_chars,
+            response_chars=result.response_chars,
+            duration_ms=result.duration_ms,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            retry_count=result.retry_count,
         )
 
     def _complete(self, prompt: str) -> AiTradeDecision:
         if not self.enabled:
-            return AiTradeDecision(False, error="AI is disabled or OPENAI_API_KEY is missing.", prompt_chars=len(prompt))
+            return AiTradeDecision(False, error="AI未启用或缺少OPENAI_API_KEY/MIMO_API_KEY。", prompt_chars=len(prompt))
         body = self._request_body(prompt)
         request = urllib.request.Request(
             self._request_url(),
@@ -125,32 +142,46 @@ class AiReviewClient:
             headers=self._headers(),
         )
         started = time.monotonic()
-        try:
-            raw = self._opener(request, self.settings.ai_review_timeout_seconds)
-            duration_ms = int((time.monotonic() - started) * 1000)
-            payload = json.loads(raw.decode("utf-8"))
-            text = _extract_ai_text(payload).strip()
-            if not text:
+        last_error = ""
+        attempts = self.settings.ai_request_retries + 1
+        for attempt in range(attempts):
+            try:
+                raw = self._opener(request, self.settings.ai_review_timeout_seconds)
+                payload = json.loads(raw.decode("utf-8"))
+                text = _extract_ai_text(payload).strip()
+                usage = _extract_usage(payload)
+                if not text:
+                    raise ValueError("AI响应没有正文。")
                 return AiTradeDecision(
-                    False,
-                    error="AI response did not contain output text.",
+                    True,
+                    raw_text=text,
                     prompt_chars=len(prompt),
-                    response_chars=0,
-                    duration_ms=duration_ms,
+                    response_chars=len(text),
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    prompt_tokens=usage["prompt_tokens"],
+                    completion_tokens=usage["completion_tokens"],
+                    total_tokens=usage["total_tokens"],
+                    retry_count=attempt,
                 )
-            return AiTradeDecision(True, raw_text=text, prompt_chars=len(prompt), response_chars=len(text), duration_ms=duration_ms)
-        except urllib.error.HTTPError as exc:
-            duration_ms = int((time.monotonic() - started) * 1000)
-            detail = exc.read().decode("utf-8", errors="replace")[:300]
-            return AiTradeDecision(False, error=f"OpenAI HTTP {exc.code}: {detail}", prompt_chars=len(prompt), duration_ms=duration_ms)
-        except TimeoutError:
-            duration_ms = int((time.monotonic() - started) * 1000)
-            return AiTradeDecision(False, error="timeout", prompt_chars=len(prompt), duration_ms=duration_ms)
-        except Exception as exc:
-            duration_ms = int((time.monotonic() - started) * 1000)
-            if "timed out" in str(exc).lower():
-                return AiTradeDecision(False, error="timeout", prompt_chars=len(prompt), duration_ms=duration_ms)
-            return AiTradeDecision(False, error=f"OpenAI request failed: {exc}", prompt_chars=len(prompt), duration_ms=duration_ms)
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:300]
+                last_error = f"HTTP {exc.code}: {detail}"
+                if exc.code < 500 and exc.code not in {408, 409, 429}:
+                    break
+            except TimeoutError:
+                last_error = "timeout"
+            except Exception as exc:
+                last_error = "timeout" if "timed out" in str(exc).lower() else f"请求失败: {exc}"
+            if attempt < attempts - 1 and self.settings.ai_retry_backoff_seconds > 0:
+                time.sleep(self.settings.ai_retry_backoff_seconds * (attempt + 1))
+
+        return AiTradeDecision(
+            False,
+            error=last_error,
+            prompt_chars=len(prompt),
+            duration_ms=int((time.monotonic() - started) * 1000),
+            retry_count=max(0, attempts - 1),
+        )
 
     def _request_url(self) -> str:
         if self.settings.openai_api_mode == "anthropic":
@@ -168,14 +199,23 @@ class AiReviewClient:
                 "max_tokens": self.settings.ai_review_max_tokens,
             }
         if self.settings.openai_api_mode == "chat":
-            return {
+            body = {
                 "model": self.settings.openai_model,
                 "messages": [
                     {"role": "system", "content": _instructions()},
                     {"role": "user", "content": prompt},
                 ],
-                "max_tokens": self.settings.ai_review_max_tokens,
+                "max_completion_tokens": self.settings.ai_review_max_tokens,
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "stream": False,
+                "stop": None,
+                "frequency_penalty": 0,
+                "presence_penalty": 0,
             }
+            if "mimo" in self.settings.openai_model.lower() or "xiaomimimo" in self.settings.openai_base_url.lower():
+                body["thinking"] = {"type": "disabled"}
+            return body
         return {
             "model": self.settings.openai_model,
             "instructions": _instructions(),
@@ -195,9 +235,9 @@ class AiReviewClient:
 
 def _instructions() -> str:
     return (
-        "你是加密货币模拟盘交易风控助手。交易决策必须只输出 JSON，不要 Markdown。"
+        "你是加密货币模拟盘交易训练助手。交易决策必须只输出 JSON，不要 Markdown。"
         "JSON 格式: {\"action\":\"buy|hold|sell\",\"confidence\":0.0,\"reason\":\"一句中文原因\"}。"
-        "不要建议移除止损，不要扩大仓位，不要声称一定盈利。"
+        "原因必须使用中文。不要承诺一定盈利。不要建议移除止损。"
     )
 
 
@@ -313,7 +353,7 @@ def _parse_trade_decision(text: str) -> AiTradeDecision:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        return AiTradeDecision(False, raw_text=raw_text, error="AI decision JSON parse failed.")
+        return AiTradeDecision(False, raw_text=raw_text, error="AI决策JSON解析失败。")
     action = str(payload.get("action") or "hold").strip().lower()
     if action not in {"buy", "hold", "sell"}:
         action = "hold"
@@ -383,6 +423,20 @@ def _extract_output_text(payload: dict) -> str:
             if isinstance(text, str):
                 chunks.append(text)
     return "\n".join(chunks)
+
+
+def _extract_usage(payload: dict) -> dict[str, int]:
+    usage = payload.get("usage") if isinstance(payload, dict) else {}
+    if not isinstance(usage, dict):
+        usage = {}
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
 
 
 def _telegram_sized(text: str, limit: int = 3500) -> str:

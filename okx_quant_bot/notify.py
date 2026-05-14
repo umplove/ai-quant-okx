@@ -24,9 +24,12 @@ class Notifier:
         if not (self.settings.telegram_controls_enabled and self.settings.telegram_bot_token):
             return
         commands = [
-            {"command": "status", "description": "查看资金状态"},
-            {"command": "stop", "description": "停止所有交易"},
-            {"command": "start", "description": "恢复交易"},
+            {"command": "status", "description": "查看资产、持仓和最近订单"},
+            {"command": "ai", "description": "查看AI配置、调用和错误统计"},
+            {"command": "positions", "description": "查看当前持仓和AI卖出意见"},
+            {"command": "training", "description": "查看本周AI训练token进度"},
+            {"command": "stop", "description": "暂停交易主循环"},
+            {"command": "start", "description": "恢复交易主循环"},
             {"command": "reset", "description": "重置资金统计"},
         ]
         token = self.settings.telegram_bot_token
@@ -69,14 +72,18 @@ class Notifier:
                 actions.append("reset")
             elif text == "/status":
                 actions.append("status")
+            elif text == "/ai":
+                actions.append("ai")
+            elif text == "/positions":
+                actions.append("positions")
+            elif text == "/training":
+                actions.append("training")
         return actions
 
     def _send_telegram(self, message: str) -> None:
         token = self.settings.telegram_bot_token
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        body = urllib.parse.urlencode(
-            {"chat_id": self.settings.telegram_chat_id, "text": message}
-        ).encode("utf-8")
+        body = urllib.parse.urlencode({"chat_id": self.settings.telegram_chat_id, "text": message}).encode("utf-8")
         request = urllib.request.Request(url, data=body, method="POST")
         with urllib.request.urlopen(request, timeout=10) as response:
             json.loads(response.read().decode("utf-8"))

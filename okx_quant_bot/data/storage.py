@@ -212,10 +212,48 @@ class Storage:
                     duration_ms integer not null,
                     error text not null,
                     reason text not null,
+                    prompt_tokens integer not null default 0,
+                    completion_tokens integer not null default 0,
+                    total_tokens integer not null default 0,
+                    retry_count integer not null default 0,
+                    created_at text default current_timestamp
+                );
+
+                create table if not exists ai_training_runs (
+                    week_key text primary key,
+                    target_tokens integer not null,
+                    prompt_tokens integer not null default 0,
+                    completion_tokens integer not null default 0,
+                    total_tokens integer not null default 0,
+                    task_count integer not null default 0,
+                    success_count integer not null default 0,
+                    error_count integer not null default 0,
+                    updated_at text default current_timestamp
+                );
+
+                create table if not exists shadow_decisions (
+                    id integer primary key autoincrement,
+                    symbol text not null,
+                    market_type text not null,
+                    strategy text not null,
+                    action text not null,
+                    confidence real not null,
+                    reason text not null,
+                    raw text not null,
                     created_at text default current_timestamp
                 );
                 """
             )
+            self._ensure_column(conn, "ai_call_audits", "prompt_tokens", "integer not null default 0")
+            self._ensure_column(conn, "ai_call_audits", "completion_tokens", "integer not null default 0")
+            self._ensure_column(conn, "ai_call_audits", "total_tokens", "integer not null default 0")
+            self._ensure_column(conn, "ai_call_audits", "retry_count", "integer not null default 0")
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        columns = {row["name"] for row in conn.execute(f"pragma table_info({table})").fetchall()}
+        if column not in columns:
+            conn.execute(f"alter table {table} add column {column} {definition}")
 
     def save_candles(self, candles: Iterable[Candle]) -> None:
         with self.session() as conn:
@@ -581,14 +619,19 @@ class Storage:
         duration_ms: int = 0,
         error: str = "",
         reason: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        total_tokens: int = 0,
+        retry_count: int = 0,
     ) -> None:
         with self.session() as conn:
             conn.execute(
                 """
                 insert into ai_call_audits(
                     symbol, intent, ok, action, confidence, prompt_chars, response_chars,
-                    duration_ms, error, reason
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    duration_ms, error, reason, prompt_tokens, completion_tokens,
+                    total_tokens, retry_count
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol,
@@ -601,6 +644,10 @@ class Storage:
                     int(duration_ms),
                     error[:1000],
                     reason[:1000],
+                    int(prompt_tokens),
+                    int(completion_tokens),
+                    int(total_tokens),
+                    int(retry_count),
                 ),
             )
 
@@ -608,7 +655,8 @@ class Storage:
         with self.session() as conn:
             rows = conn.execute(
                 """
-                select intent, ok, action, prompt_chars, response_chars, duration_ms, error
+                select intent, ok, action, prompt_chars, response_chars, duration_ms, error,
+                       prompt_tokens, completion_tokens, total_tokens, retry_count
                 from ai_call_audits
                 order by created_at desc, id desc
                 limit ?
@@ -623,14 +671,101 @@ class Storage:
         sell_count = sum(1 for row in rows if row["action"] == "sell")
         prompt_chars = sum(int(row["prompt_chars"]) for row in rows)
         response_chars = sum(int(row["response_chars"]) for row in rows)
+        total_tokens = sum(int(row["total_tokens"]) for row in rows)
+        retry_count = sum(int(row["retry_count"]) for row in rows)
         avg_ms = sum(int(row["duration_ms"]) for row in rows) / total
         errors = [str(row["error"]) for row in rows if row["error"]]
         error_tail = f"; 最近错误: {errors[0][:60]}" if errors else ""
         return (
             f"AI调用: {ok_count}/{total}成功; buy={buy_count}; sell={sell_count}; "
-            f"输入约{prompt_chars}字; 输出约{response_chars}字; 平均{avg_ms:.0f}ms"
+            f"输入约{prompt_chars}字; 输出约{response_chars}字; token={total_tokens}; "
+            f"重试={retry_count}; 平均{avg_ms:.0f}ms"
             f"{error_tail}"
         )
+
+    def add_training_usage(
+        self,
+        week_key: str,
+        target_tokens: int,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        ok: bool,
+    ) -> None:
+        with self.session() as conn:
+            conn.execute(
+                """
+                insert into ai_training_runs(
+                    week_key, target_tokens, prompt_tokens, completion_tokens,
+                    total_tokens, task_count, success_count, error_count
+                ) values (?, ?, ?, ?, ?, 1, ?, ?)
+                on conflict(week_key) do update set
+                    target_tokens = excluded.target_tokens,
+                    prompt_tokens = ai_training_runs.prompt_tokens + excluded.prompt_tokens,
+                    completion_tokens = ai_training_runs.completion_tokens + excluded.completion_tokens,
+                    total_tokens = ai_training_runs.total_tokens + excluded.total_tokens,
+                    task_count = ai_training_runs.task_count + 1,
+                    success_count = ai_training_runs.success_count + excluded.success_count,
+                    error_count = ai_training_runs.error_count + excluded.error_count,
+                    updated_at = current_timestamp
+                """,
+                (
+                    week_key,
+                    int(target_tokens),
+                    int(prompt_tokens),
+                    int(completion_tokens),
+                    int(total_tokens),
+                    int(ok),
+                    0 if ok else 1,
+                ),
+            )
+
+    def training_summary(self, week_key: str, target_tokens: int) -> str:
+        with self.session() as conn:
+            row = conn.execute("select * from ai_training_runs where week_key = ?", (week_key,)).fetchone()
+        if row is None:
+            return f"训练进度: 0/{target_tokens} token，完成率0.00%，任务0，成功0，失败0"
+        total_tokens = int(row["total_tokens"])
+        pct = 0.0 if target_tokens <= 0 else total_tokens / target_tokens * 100.0
+        return (
+            f"训练进度: {total_tokens}/{target_tokens} token，完成率{pct:.2f}%，"
+            f"任务{row['task_count']}，成功{row['success_count']}，失败{row['error_count']}"
+        )
+
+    def save_shadow_decision(
+        self,
+        symbol: str,
+        market_type: str,
+        strategy: str,
+        action: str,
+        confidence: float,
+        reason: str,
+        raw: str = "",
+    ) -> None:
+        with self.session() as conn:
+            conn.execute(
+                """
+                insert into shadow_decisions(symbol, market_type, strategy, action, confidence, reason, raw)
+                values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (symbol, market_type, strategy, action, float(confidence), reason[:1000], raw[:4000]),
+            )
+
+    def recent_shadow_decisions(self, limit: int = 8) -> list[str]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select symbol, market_type, strategy, action, confidence, reason
+                from shadow_decisions
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            f"{r['symbol']} {r['market_type']}/{r['strategy']} -> {r['action']} conf={r['confidence']:.2f}: {r['reason']}"
+            for r in rows
+        ]
 
     def recent_ai_decisions(self, limit: int = 12) -> list[str]:
         with self.session() as conn:

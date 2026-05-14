@@ -86,11 +86,12 @@ class Settings:
     require_info_confirmation: bool = False
     telegram_money_only: bool = True
     telegram_controls_enabled: bool = True
+    telegram_auto_reports: bool = False
     money_report_interval_scans: int = 1
     openai_api_key: str = ""
-    openai_model: str = "gpt-5.2"
-    openai_base_url: str = "https://api.openai.com/v1"
-    openai_api_mode: str = "responses"
+    openai_model: str = "mimo-v2.5-pro"
+    openai_base_url: str = "https://api.xiaomimimo.com/v1"
+    openai_api_mode: str = "chat"
     ai_review_max_tokens: int = 2000
     ai_review_timeout_seconds: float = 12.0
     ai_review_enabled: bool = False
@@ -98,6 +99,11 @@ class Settings:
     ai_review_max_candidates: int = 5
     ai_always_on: bool = True
     ai_exploration_fraction: float = 0.20
+    ai_request_retries: int = 2
+    ai_retry_backoff_seconds: float = 1.5
+    ai_training_enabled: bool = True
+    ai_training_workers: int = 4
+    ai_weekly_token_target: int = 1_000_000_000
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -151,11 +157,12 @@ class Settings:
             require_info_confirmation=_bool(os.getenv("REQUIRE_INFO_CONFIRMATION"), False),
             telegram_money_only=_bool(os.getenv("TELEGRAM_MONEY_ONLY"), True),
             telegram_controls_enabled=_bool(os.getenv("TELEGRAM_CONTROLS_ENABLED"), True),
+            telegram_auto_reports=_bool(os.getenv("TELEGRAM_AUTO_REPORTS"), False),
             money_report_interval_scans=_int("MONEY_REPORT_INTERVAL_SCANS", 1),
-            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
-            openai_model=os.getenv("OPENAI_MODEL", "gpt-5.2"),
-            openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
-            openai_api_mode=os.getenv("OPENAI_API_MODE", "responses").strip().lower(),
+            openai_api_key=os.getenv("OPENAI_API_KEY") or os.getenv("MIMO_API_KEY", ""),
+            openai_model=os.getenv("OPENAI_MODEL", "mimo-v2.5-pro"),
+            openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.xiaomimimo.com/v1").rstrip("/"),
+            openai_api_mode=os.getenv("OPENAI_API_MODE", "chat").strip().lower(),
             ai_review_max_tokens=_int("AI_REVIEW_MAX_TOKENS", 2000),
             ai_review_timeout_seconds=_float("AI_REVIEW_TIMEOUT_SECONDS", 12.0),
             ai_review_enabled=_bool(os.getenv("AI_REVIEW_ENABLED"), False),
@@ -163,6 +170,11 @@ class Settings:
             ai_review_max_candidates=_int("AI_REVIEW_MAX_CANDIDATES", 5),
             ai_always_on=_bool(os.getenv("AI_ALWAYS_ON"), True),
             ai_exploration_fraction=_float("AI_EXPLORATION_FRACTION", 0.20),
+            ai_request_retries=_int("AI_REQUEST_RETRIES", 2),
+            ai_retry_backoff_seconds=_float("AI_RETRY_BACKOFF_SECONDS", 1.5),
+            ai_training_enabled=_bool(os.getenv("AI_TRAINING_ENABLED"), True),
+            ai_training_workers=_int("AI_TRAINING_WORKERS", 4),
+            ai_weekly_token_target=_int("AI_WEEKLY_TOKEN_TARGET", 1_000_000_000),
         )
 
     def require_safe_trading_config(self) -> None:
@@ -196,3 +208,20 @@ class Settings:
             raise ValueError("AI_REVIEW_MAX_CANDIDATES must be positive.")
         if self.ai_exploration_fraction < 0 or self.ai_exploration_fraction > 1:
             raise ValueError("AI_EXPLORATION_FRACTION must be between 0 and 1.")
+        if self.ai_request_retries < 0:
+            raise ValueError("AI_REQUEST_RETRIES must be non-negative.")
+        if self.ai_retry_backoff_seconds < 0:
+            raise ValueError("AI_RETRY_BACKOFF_SECONDS must be non-negative.")
+        if self.ai_training_workers <= 0:
+            raise ValueError("AI_TRAINING_WORKERS must be positive.")
+        if self.ai_weekly_token_target <= 0:
+            raise ValueError("AI_WEEKLY_TOKEN_TARGET must be positive.")
+
+    def ai_config_warning(self) -> str:
+        model = self.openai_model.lower()
+        base = self.openai_base_url.lower()
+        if "mimo" in model and not (self.openai_api_mode == "chat" and base == "https://api.xiaomimimo.com/v1"):
+            return "MiMo模型建议配置为 OPENAI_API_MODE=chat 且 OPENAI_BASE_URL=https://api.xiaomimimo.com/v1"
+        if model.startswith("gpt-") and "xiaomimimo" in base:
+            return "OpenAI官方模型不应使用小米Base URL，请改用MiMo模型或切回OpenAI官方Base URL"
+        return ""
