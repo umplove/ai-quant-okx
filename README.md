@@ -4,6 +4,8 @@ OKX AI Quant Bot is a Python-based cryptocurrency trading bot for OKX spot, marg
 
 The project combines OKX market scanning, momentum scoring, optional AI review, Telegram controls, SQLite persistence, order reconciliation, stop-loss management, and experience scoring. It can be used as a research and automation foundation for multi-market trading experiments.
 
+For a detailed code walkthrough, see [docs/CODE_OVERVIEW.md](docs/CODE_OVERVIEW.md).
+
 ## Features
 
 - OKX spot market data, balance checks, market orders, limit orders, cancellation, pending-order queries, and stop-loss algo orders.

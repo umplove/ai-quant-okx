@@ -11,6 +11,7 @@
 - Local config check: `python -m okx_quant_bot doctor --no-network`
 - Main runtime: `python -m okx_quant_bot run-momentum`
 - One-shot scan: `python -m okx_quant_bot scan-momentum`
+- Code walkthrough: `docs/CODE_OVERVIEW.md`
 
 ## Current Safety Architecture
 - `okx_quant_bot/momentum_runner.py` owns momentum execution, pending entry order sync, position updates, and stop-loss replacement.
