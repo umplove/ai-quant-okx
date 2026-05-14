@@ -6,22 +6,11 @@ import time
 from dataclasses import dataclass
 from datetime import date
 
-from okx_quant_bot.ai_reviewer import AiReviewClient, _parse_trade_decision
+from okx_quant_bot.ai_reviewer import AiReviewClient
 from okx_quant_bot.config import Settings
 from okx_quant_bot.data import Storage
+from okx_quant_bot.models import Position
 from okx_quant_bot.momentum import MomentumScan
-
-
-SHADOW_MARKETS = (
-    ("spot", "现货分批买卖"),
-    ("margin", "杠杆影子判断"),
-    ("swap", "永续合约影子判断"),
-    ("futures", "交割合约影子判断"),
-    ("options", "期权方向影子判断"),
-    ("grid", "网格策略影子判断"),
-    ("trailing", "追踪止盈止损影子判断"),
-    ("tp_sl", "止盈止损组合影子判断"),
-)
 
 
 @dataclass(frozen=True)
@@ -52,6 +41,11 @@ class AiTrainingPool:
             thread.start()
             self._threads.append(thread)
 
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        for thread in self._threads:
+            thread.join(timeout=timeout)
+
     def status(self) -> dict[str, int]:
         with self._lock:
             dropped = self._dropped_tasks
@@ -66,31 +60,27 @@ class AiTrainingPool:
             "worker_errors": errors,
         }
 
-    def enqueue_scan(self, scan: MomentumScan, strategy_context: str) -> None:
+    def enqueue_scan(
+        self,
+        scan: MomentumScan,
+        strategy_context: str,
+        positions: list[Position] | tuple[Position, ...] = (),
+    ) -> None:
         if not self._threads:
             return
-        candidates = scan.candidates[: self.settings.ai_review_max_candidates]
         market_snapshot = _market_snapshot(scan)
-        for candidate in candidates:
+        prices = {ticker.symbol: ticker.last for ticker in scan.tickers}
+        for position in positions:
+            current_price = prices.get(position.symbol) or prices.get(_spot_symbol(position.symbol), position.avg_entry_price)
             self._put(
                 TrainingTask(
-                    symbol=candidate.symbol,
-                    intent="training_candidate",
-                    prompt=_candidate_training_prompt(candidate.symbol, market_snapshot, strategy_context),
-                    market_type="spot",
-                    strategy="候选买入复盘",
+                    symbol=position.symbol,
+                    intent="portfolio_training",
+                    prompt=_position_training_prompt(position, current_price, market_snapshot, strategy_context),
+                    market_type=position.market_type.lower(),
+                    strategy="真实模拟盘持仓复盘",
                 )
             )
-            for market_type, strategy in SHADOW_MARKETS:
-                self._put(
-                    TrainingTask(
-                        symbol=candidate.symbol,
-                        intent="shadow",
-                        prompt=_shadow_prompt(candidate.symbol, market_type, strategy, market_snapshot, strategy_context),
-                        market_type=market_type,
-                        strategy=strategy,
-                    )
-                )
 
     def _put(self, task: TrainingTask) -> None:
         try:
@@ -144,17 +134,6 @@ class AiTrainingPool:
             attempted_tokens=result.attempted_tokens,
             ok=result.ok,
         )
-        if task.intent == "shadow" and result.ok:
-            decision = _parse_trade_decision(result.raw_text)
-            self.storage.save_shadow_decision(
-                task.symbol,
-                task.market_type,
-                task.strategy,
-                decision.action,
-                decision.confidence,
-                decision.reason,
-                result.raw_text,
-            )
 
 
 def current_week_key() -> str:
@@ -173,13 +152,22 @@ def _market_snapshot(scan: MomentumScan) -> str:
     return "\n".join(lines)
 
 
-def _candidate_training_prompt(symbol: str, market_snapshot: str, strategy_context: str) -> str:
+def _position_training_prompt(
+    position: Position,
+    current_price: float,
+    market_snapshot: str,
+    strategy_context: str,
+) -> str:
     return "\n".join(
         [
-            "你正在为模拟盘交易机器人积累训练经验。",
-            f"重点币种: {symbol}",
-            "任务: 复盘这个币如果现在买入、等待、或卖出会分别有什么风险和机会。",
-            '请只输出 JSON: {"action":"buy|hold|sell","confidence":0.0,"reason":"中文原因"}',
+            "你正在为OKX模拟盘真实持仓做经验复盘，不要做影子市场假设。",
+            f"持仓: {position.symbol}",
+            f"市场: {position.market_type}/{position.direction}",
+            f"数量: {position.base_qty:.8g}",
+            f"成本: {position.avg_entry_price:.8g}",
+            f"现价: {current_price:.8g}",
+            f"浮动收益率: {position.return_pct(current_price):+.2f}%",
+            '请只输出 JSON: {"action":"hold|sell","confidence":0.0,"reason":"中文原因"}',
             market_snapshot,
             "历史经验:",
             strategy_context or "- 暂无",
@@ -187,17 +175,5 @@ def _candidate_training_prompt(symbol: str, market_snapshot: str, strategy_conte
     )
 
 
-def _shadow_prompt(symbol: str, market_type: str, strategy: str, market_snapshot: str, strategy_context: str) -> str:
-    return "\n".join(
-        [
-            "你正在做影子全市场交易训练，不会真实下单。",
-            f"币种: {symbol}",
-            f"影子市场: {market_type}",
-            f"影子策略: {strategy}",
-            "任务: 判断如果使用这个交易手段，当前更适合 buy、hold 还是 sell。",
-            '请只输出 JSON: {"action":"buy|hold|sell","confidence":0.0,"reason":"中文原因"}',
-            market_snapshot,
-            "历史经验:",
-            strategy_context or "- 暂无",
-        ]
-    )
+def _spot_symbol(symbol: str) -> str:
+    return symbol[:-5] if symbol.endswith("-SWAP") else symbol

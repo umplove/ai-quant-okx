@@ -183,6 +183,44 @@ class AiReviewClient:
         if not result.ok:
             return result
         parsed = _parse_trade_decision(result.raw_text)
+        if not parsed.ok:
+            repaired = self._complete(_json_repair_prompt(result.raw_text))
+            if repaired.ok:
+                repaired_parsed = _parse_trade_decision(repaired.raw_text)
+                if repaired_parsed.ok:
+                    return AiTradeDecision(
+                        ok=True,
+                        action=repaired_parsed.action,
+                        confidence=repaired_parsed.confidence,
+                        reason=repaired_parsed.reason,
+                        raw_text=repaired.raw_text,
+                        entry_mode=repaired_parsed.entry_mode,
+                        exit_mode=repaired_parsed.exit_mode,
+                        size_mode=repaired_parsed.size_mode,
+                        stop_mode=repaired_parsed.stop_mode,
+                        replace_mode=repaired_parsed.replace_mode,
+                        prompt_chars=result.prompt_chars + repaired.prompt_chars,
+                        response_chars=result.response_chars + repaired.response_chars,
+                        duration_ms=result.duration_ms + repaired.duration_ms,
+                        prompt_tokens=result.prompt_tokens + repaired.prompt_tokens,
+                        completion_tokens=result.completion_tokens + repaired.completion_tokens,
+                        total_tokens=result.total_tokens + repaired.total_tokens,
+                        attempted_tokens=result.attempted_tokens + repaired.attempted_tokens,
+                        retry_count=result.retry_count + repaired.retry_count,
+                    )
+            return AiTradeDecision(
+                False,
+                raw_text=result.raw_text,
+                error=parsed.error,
+                prompt_chars=result.prompt_chars + getattr(repaired, "prompt_chars", 0),
+                response_chars=result.response_chars + getattr(repaired, "response_chars", 0),
+                duration_ms=result.duration_ms + getattr(repaired, "duration_ms", 0),
+                prompt_tokens=result.prompt_tokens + getattr(repaired, "prompt_tokens", 0),
+                completion_tokens=result.completion_tokens + getattr(repaired, "completion_tokens", 0),
+                total_tokens=result.total_tokens + getattr(repaired, "total_tokens", 0),
+                attempted_tokens=result.attempted_tokens + getattr(repaired, "attempted_tokens", 0),
+                retry_count=result.retry_count + getattr(repaired, "retry_count", 0),
+            )
         return AiTradeDecision(
             ok=parsed.ok,
             action=parsed.action,
@@ -420,6 +458,17 @@ def _attribution_prompt(symbol: str, pnl_usdt: float, return_pct: float, summary
             f"事件摘要: {summary}",
             "策略经验:",
             strategy_memory or "- 暂无",
+        ]
+    )
+
+
+def _json_repair_prompt(raw_text: str) -> str:
+    return "\n".join(
+        [
+            "把下面的交易决策修复成严格 JSON，不要解释，不要 Markdown。",
+            '必须符合: {"action":"buy|hold|sell","entry_mode":"market_now|limit_pullback|split_limit|breakout_confirm|wait","exit_mode":"hold|sell_all|sell_partial|trail_profit|move_to_breakeven","size_mode":"explore|normal|strong|reduced","stop_mode":"fixed|wide|tight|breakeven|trailing","replace_mode":"none|replace_weakest|free_cash_only","confidence":0.0,"reason":"中文原因"}',
+            "原始内容:",
+            raw_text[:4000],
         ]
     )
 

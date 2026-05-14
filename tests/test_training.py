@@ -5,14 +5,14 @@ from unittest.mock import patch
 
 from okx_quant_bot.ai_reviewer import AiTradeDecision
 from okx_quant_bot.data import Storage
-from okx_quant_bot.models import CandidateScore, MarketTicker
+from okx_quant_bot.models import CandidateScore, MarketTicker, Position
 from okx_quant_bot.momentum import MomentumScan
 from okx_quant_bot.training import AiTrainingPool, current_week_key
 from tests.test_strategy_risk import settings_for
 
 
 class TrainingPoolTests(unittest.TestCase):
-    def test_training_pool_records_usage_and_shadow_decisions(self):
+    def test_training_pool_records_real_portfolio_usage_without_shadow(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "bot.sqlite3"
             storage = Storage(db)
@@ -48,11 +48,13 @@ class TrainingPoolTests(unittest.TestCase):
                 )
                 pool = AiTrainingPool(settings, storage)
                 pool.start()
-                pool.enqueue_scan(scan, "经验")
+                pool.enqueue_scan(scan, "经验", [Position("AAA-USDT", 1, 2, 2)])
                 pool._queue.join()
+                pool.stop()
 
-            self.assertIn("1080", storage.training_summary(current_week_key(), settings.ai_weekly_token_target))
-            self.assertTrue(storage.recent_shadow_decisions())
+            self.assertIn("120", storage.training_summary(current_week_key(), settings.ai_weekly_token_target))
+            self.assertFalse(storage.recent_shadow_decisions())
+            self.assertIn("portfolio_training", storage.recent_ai_call_breakdown())
 
     def test_worker_exception_is_recorded_and_thread_continues(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -96,7 +98,7 @@ class TrainingPoolTests(unittest.TestCase):
                 client.return_value.complete_training.side_effect = complete_training
                 pool = AiTrainingPool(settings, storage)
                 pool.start()
-                pool.enqueue_scan(scan, "经验")
+                pool.enqueue_scan(scan, "经验", [Position("AAA-USDT", 1, 2, 2), Position("BBB-USDT", 1, 2, 2)])
                 pool._queue.join()
 
             status = pool.status()
@@ -104,6 +106,7 @@ class TrainingPoolTests(unittest.TestCase):
             self.assertGreaterEqual(status["worker_errors"], 1)
             self.assertTrue(storage.recent_bot_errors())
             self.assertIn("成功", storage.training_summary(current_week_key(), settings.ai_weekly_token_target))
+            pool.stop()
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 from okx_quant_bot.ai_reviewer import AiReviewClient
 from okx_quant_bot.config import Settings
@@ -58,6 +59,7 @@ class MomentumBotRunner:
         self.storage.save_info_signals(scan.info_signals)
         self.storage.save_intelligence_items(scan.intelligence_items or [])
         self.storage.save_candidate_scores(scan.candidates)
+        sync_note = self._sync_exchange_state(scan)
         self._sync_pending_entry_orders(scan)
         self._sell_positions_with_hard_exit(scan)
         self._review_open_trades(scan)
@@ -80,8 +82,8 @@ class MomentumBotRunner:
                 self._execute_buy_decision(candidate, decision, scan)
 
         if self.training_pool is not None:
-            self.training_pool.enqueue_scan(scan, self._strategy_context())
-        self._send_money_report(scan=scan, ai_note=ai_note)
+            self.training_pool.enqueue_scan(scan, self._strategy_context(), self.storage.open_positions())
+        self._send_money_report(scan=scan, ai_note=ai_note, note=sync_note)
         return scan
 
     def _tradable_candidates(self, scan: MomentumScan) -> list[CandidateScore]:
@@ -139,9 +141,19 @@ class MomentumBotRunner:
 
     def _ai_learning_candidates(self, scan: MomentumScan) -> list[CandidateScore]:
         allowed = set(self.settings.symbols)
+        open_count = self.storage.open_position_count()
+        available_slots = max(0, self.settings.max_open_positions - open_count)
+        if available_slots <= 0:
+            self.storage.set_state("last_buy_ai_skip_reason", "持仓已满，只做持仓管理和卖出/换仓判断")
+            return []
+        review_limit = min(self.settings.ai_review_max_candidates, available_slots + 1)
+        self.storage.set_state(
+            "last_buy_ai_skip_reason",
+            f"当前持仓{open_count}/{self.settings.max_open_positions}，买入AI最多审核{review_limit}个候选",
+        )
         return [
             candidate
-            for candidate in scan.candidates[: self.settings.ai_review_max_candidates]
+            for candidate in scan.candidates[:review_limit]
             if candidate.confirmed and candidate.symbol in allowed
         ]
 
@@ -879,6 +891,124 @@ class MomentumBotRunner:
             self.storage.save_trade_review(review)
             self.storage.save_strategy_lesson(review.symbol, review.pnl_usdt, review.return_pct, review.summary, review.raw)
 
+    def _sync_exchange_state(self, scan: MomentumScan) -> str:
+        if not self.settings.trading_enabled or not hasattr(self.exchange, "get_positions"):
+            return ""
+        prices = {ticker.symbol: ticker.last for ticker in scan.tickers}
+        try:
+            balance_payload = self.exchange.get_balance(None)
+            account = _account_snapshot_from_balance(balance_payload)
+            self._save_account_snapshot(account)
+            synced_positions = self._positions_from_okx(balance_payload, prices)
+            for market_type in ("MARGIN", "SWAP"):
+                if market_type in set(self.settings.enabled_market_types):
+                    synced_positions.extend(self._derivative_positions_from_okx(market_type))
+            before, after = self.storage.replace_open_positions(synced_positions)
+            open_order_count = self._sync_open_orders()
+            okx_count = len([position for position in synced_positions if position.is_open])
+            self.storage.set_state("okx_last_position_count", str(okx_count))
+            status = (
+                f"OKX同步正常: OKX持仓={okx_count}, 本地同步前={before}, 本地同步后={after}, "
+                f"open_orders={open_order_count}"
+            )
+            self.storage.set_state("okx_sync_status", status)
+            if before != after or okx_count != before:
+                self.notifier.send_money(f"OKX持仓 != 本地持仓，已执行同步。{status}")
+                return status
+            return ""
+        except Exception as exc:
+            message = f"OKX同步失败: {exc}"
+            self.storage.set_state("okx_sync_status", message)
+            self.storage.save_bot_error("okx_sync", message, traceback.format_exc())
+            self.notifier.send_money(message)
+            return message
+
+    def _positions_from_okx(self, balance_payload: dict, prices: dict[str, float]) -> list[Position]:
+        allowed_symbols = set(self.settings.symbols)
+        existing = {position.symbol: position for position in self.storage.open_positions()}
+        positions: list[Position] = []
+        data = balance_payload.get("data", [{}])
+        details = data[0].get("details", []) if data and isinstance(data[0], dict) else []
+        for item in details:
+            ccy = str(item.get("ccy") or "").upper()
+            symbol = f"{ccy}-USDT"
+            if symbol not in allowed_symbols:
+                continue
+            qty = _float_or_zero(item.get("eq") or item.get("cashBal") or item.get("availBal"))
+            eq_usd = _float_or_zero(item.get("eqUsd") or item.get("disEq"))
+            price = prices.get(symbol)
+            if qty <= 0 or (eq_usd <= 1 and qty * (price or 0) <= 1):
+                continue
+            previous = existing.get(symbol)
+            entry = previous.avg_entry_price if previous and previous.avg_entry_price > 0 else (price or 0.0)
+            if entry <= 0:
+                continue
+            positions.append(
+                Position(
+                    symbol=symbol,
+                    base_qty=qty,
+                    avg_entry_price=entry,
+                    highest_price=max(entry, price or entry, previous.highest_price if previous else 0.0),
+                    market_type="SPOT",
+                    direction="long",
+                    leverage=1.0,
+                    margin_mode="cash",
+                )
+            )
+        return positions
+
+    def _derivative_positions_from_okx(self, market_type: str) -> list[Position]:
+        payload = self.exchange.get_positions(market_type)
+        positions: list[Position] = []
+        for item in payload.get("data", []):
+            symbol = str(item.get("instId") or "")
+            if not symbol:
+                continue
+            size = abs(_float_or_zero(item.get("pos") or item.get("availPos")))
+            if size <= 0:
+                continue
+            avg_price = _float_or_zero(item.get("avgPx") or item.get("openAvgPx"))
+            mark_price = _float_or_zero(item.get("markPx") or item.get("last"))
+            if avg_price <= 0:
+                avg_price = mark_price
+            if avg_price <= 0:
+                continue
+            pos_side = str(item.get("posSide") or "").lower()
+            raw_pos = _float_or_zero(item.get("pos"))
+            direction = pos_side if pos_side in {"long", "short"} else ("short" if raw_pos < 0 else "long")
+            positions.append(
+                Position(
+                    symbol=symbol,
+                    base_qty=size,
+                    avg_entry_price=avg_price,
+                    highest_price=max(avg_price, mark_price),
+                    market_type=market_type,
+                    direction=direction,
+                    leverage=_float_or_zero(item.get("lever")) or self.settings.max_leverage,
+                    margin_mode=str(item.get("mgnMode") or self.settings.margin_mode),
+                )
+            )
+        return positions
+
+    def _sync_open_orders(self) -> int:
+        total = 0
+        for market_type in ("SPOT", "MARGIN", "SWAP"):
+            if market_type not in set(self.settings.enabled_market_types):
+                continue
+            try:
+                payload = self.exchange.list_open_orders(inst_type=market_type)
+            except TypeError:
+                payload = self.exchange.list_open_orders()
+            for row in payload.get("data", []):
+                self.storage.save_exchange_order_snapshot(row, market_type)
+                total += 1
+        self.storage.set_state("okx_open_order_count", str(total))
+        return total
+
+    def _save_account_snapshot(self, account: dict[str, float]) -> None:
+        for key, value in account.items():
+            self.storage.set_state(f"okx_account_{key}", f"{value:.8f}")
+
     def _send_money_report(
         self,
         scan: MomentumScan | None = None,
@@ -893,14 +1023,21 @@ class MomentumBotRunner:
         if scan is not None and count % self.settings.money_report_interval_scans != 0:
             return
         snapshot = self._money_snapshot()
+        sync_status = self.storage.get_state("okx_sync_status", "OKX同步未运行")
+        okx_position_count = self.storage.get_state("okx_last_position_count", str(self.storage.open_position_count()))
         message = "\n".join(
             [
-                f"总资产: {snapshot['equity']:.2f} USDT",
-                f"今日盈亏: {snapshot['daily_pnl']:+.2f} USDT",
-                f"累计盈亏: {snapshot['pnl']:+.2f} USDT",
-                f"当前持仓: {self.storage.open_position_count()}/{self.settings.max_open_positions}",
-                f"盈亏比: {snapshot['return_pct']:+.2f}%",
+                f"OKX总权益: {snapshot['equity']:.2f} USDT",
+                f"OKX可用: {snapshot.get('available', 0.0):.2f} USDT",
+                f"OKX占用: {snapshot.get('occupied', 0.0):.2f} USDT",
+                f"持仓: OKX={okx_position_count}, 本地={self.storage.open_position_count()}/{self.settings.max_open_positions}",
+                f"同步: {sync_status}",
+                f"买入AI: {self.storage.get_state('last_buy_ai_skip_reason', '暂无')}",
+                f"今日变化: {snapshot['daily_pnl']:+.2f} USDT",
+                f"本地累计盈亏: {snapshot['pnl']:+.2f} USDT",
+                f"本地盈亏比: {snapshot['return_pct']:+.2f}%",
                 self.storage.recent_ai_call_summary(),
+                self.storage.recent_ai_call_breakdown(),
             ]
         )
         if ai_note:
@@ -913,7 +1050,8 @@ class MomentumBotRunner:
             self.storage.save_strategy_lesson(best, float(snapshot["pnl"]), float(snapshot["return_pct"]), "资金快照", message)
 
     def _money_snapshot(self) -> dict[str, float]:
-        equity = self._account_equity()
+        account = self._account_equity_snapshot()
+        equity = account["equity"]
         baseline_raw = self.storage.get_state("money_baseline_equity", "")
         if not baseline_raw:
             self.storage.set_state("money_baseline_equity", str(equity))
@@ -930,19 +1068,25 @@ class MomentumBotRunner:
         pnl = equity - baseline
         daily_pnl = equity - daily_baseline
         return_pct = 0.0 if baseline <= 0 else pnl / baseline * 100.0
-        return {"equity": equity, "daily_pnl": daily_pnl, "pnl": pnl, "return_pct": return_pct}
+        return {
+            "equity": equity,
+            "available": account["available"],
+            "occupied": account["occupied"],
+            "daily_pnl": daily_pnl,
+            "pnl": pnl,
+            "return_pct": return_pct,
+        }
 
     def _account_equity(self) -> float:
+        return self._account_equity_snapshot()["equity"]
+
+    def _account_equity_snapshot(self) -> dict[str, float]:
         if not self.settings.trading_enabled:
-            return 10000.0
-        payload = self.exchange.get_balance("USDT")
-        data = payload.get("data", [{}])[0]
-        total = data.get("totalEq")
-        if total not in {None, ""}:
-            return float(total)
-        details = data.get("details", [])
-        usdt = next((item for item in details if item.get("ccy") == "USDT"), {})
-        return float(usdt.get("eq") or usdt.get("cashBal") or usdt.get("availBal") or 0)
+            return {"equity": 10000.0, "available": 10000.0, "occupied": 0.0}
+        payload = self.exchange.get_balance(None)
+        account = _account_snapshot_from_balance(payload)
+        self._save_account_snapshot(account)
+        return account
 
     def _handle_controls(self) -> None:
         for action in self.notifier.poll_controls(self.storage):
@@ -1033,6 +1177,7 @@ class MomentumBotRunner:
                 f"执行决策={'开启' if self.settings.ai_execution_decisions_enabled else '关闭'}; 行情状态={'开启' if self.settings.market_regime_enabled else '关闭'}",
                 f"配置自检: {warning or '正常'}",
                 self.storage.recent_ai_call_summary(),
+                self.storage.recent_ai_call_breakdown(),
             ]
         )
 
@@ -1068,6 +1213,8 @@ class MomentumBotRunner:
 
     def _training_message(self) -> str:
         lines = [self.storage.training_summary(current_week_key(), self.settings.ai_weekly_token_target)]
+        lines.insert(0, "真实模拟盘经验训练:")
+        lines.append(self.storage.recent_ai_call_breakdown())
         if self.training_pool is not None:
             status = self.training_pool.status()
             lines.append(
@@ -1075,7 +1222,7 @@ class MomentumBotRunner:
                 f"线程{status['alive_threads']}/{status['threads']}，队列{status['queue_size']}，"
                 f"丢弃{status['dropped_tasks']}，线程异常{status['worker_errors']}"
             )
-        shadows = self.storage.recent_shadow_decisions(limit=6)
+        shadows = []
         if shadows:
             lines.extend(["最近影子决策:", *shadows])
         return "\n".join(lines)
@@ -1113,6 +1260,7 @@ class MomentumBotRunner:
         return "\n".join(["最近异常:", *errors])
 
     def _shadow_message(self) -> str:
+        return "影子训练已停用。AI token 现在只用于真实模拟盘持仓、候选开仓、换仓和成交归因。"
         shadows = self.storage.recent_shadow_decisions(limit=20)
         if not shadows:
             return "暂无影子全市场建议。"
@@ -1210,6 +1358,33 @@ def _order_payload(payload: dict) -> dict:
     if isinstance(data, list) and data and isinstance(data[0], dict):
         return data[0]
     return payload if isinstance(payload, dict) else {}
+
+
+def _account_snapshot_from_balance(payload: dict[str, Any]) -> dict[str, float]:
+    data = payload.get("data", [{}])
+    first = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else {}
+    details = first.get("details", []) if isinstance(first.get("details"), list) else []
+    equity = _float_or_zero(first.get("totalEq"))
+    available = 0.0
+    occupied = 0.0
+    for item in details:
+        eq_usd = _float_or_zero(item.get("eqUsd") or item.get("disEq"))
+        eq_qty = _float_or_zero(item.get("eq") or item.get("cashBal"))
+        avail_usd = _float_or_zero(item.get("availEq"))
+        if avail_usd <= 0 and eq_qty > 0 and eq_usd > 0:
+            avail_usd = eq_usd * _float_or_zero(item.get("availBal")) / eq_qty
+        frozen_usd = _float_or_zero(item.get("imr"))
+        if frozen_usd <= 0 and eq_qty > 0 and eq_usd > 0:
+            frozen_usd = eq_usd * _float_or_zero(item.get("frozenBal") or item.get("ordFrozen")) / eq_qty
+        available += avail_usd
+        occupied += frozen_usd
+        if equity <= 0:
+            equity += eq_usd
+    if available <= 0:
+        available = _float_or_zero(first.get("availEq"))
+    if occupied <= 0 and equity > available:
+        occupied = max(0.0, equity - available)
+    return {"equity": equity, "available": available, "occupied": occupied}
 
 
 def _spot_symbol(symbol: str) -> str:

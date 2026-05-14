@@ -691,6 +691,64 @@ class Storage:
             for row in rows
         ]
 
+    def replace_open_positions(self, positions: Iterable[Position]) -> tuple[int, int]:
+        incoming = list(positions)
+        incoming_symbols = {position.symbol for position in incoming}
+        before = self.open_position_count()
+        with self.session() as conn:
+            for position in incoming:
+                conn.execute(
+                    """
+                    insert into positions(
+                        symbol, base_qty, avg_entry_price, highest_price,
+                        market_type, direction, leverage, margin_mode, opened_at
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                    on conflict(symbol) do update set
+                        base_qty = excluded.base_qty,
+                        avg_entry_price = excluded.avg_entry_price,
+                        highest_price = max(positions.highest_price, excluded.highest_price),
+                        market_type = excluded.market_type,
+                        direction = excluded.direction,
+                        leverage = excluded.leverage,
+                        margin_mode = excluded.margin_mode,
+                        opened_at = case
+                            when positions.base_qty <= 0 or positions.avg_entry_price <= 0 then excluded.opened_at
+                            else coalesce(positions.opened_at, excluded.opened_at)
+                        end,
+                        updated_at = current_timestamp
+                    """,
+                    (
+                        position.symbol,
+                        position.base_qty,
+                        position.avg_entry_price,
+                        position.highest_price,
+                        position.market_type,
+                        position.direction,
+                        position.leverage,
+                        position.margin_mode,
+                    ),
+                )
+            if incoming_symbols:
+                placeholders = ",".join("?" for _ in incoming_symbols)
+                conn.execute(
+                    f"""
+                    update positions
+                    set base_qty = 0, avg_entry_price = 0, highest_price = 0, updated_at = current_timestamp
+                    where base_qty > 0 and symbol not in ({placeholders})
+                    """,
+                    tuple(incoming_symbols),
+                )
+            else:
+                conn.execute(
+                    """
+                    update positions
+                    set base_qty = 0, avg_entry_price = 0, highest_price = 0, updated_at = current_timestamp
+                    where base_qty > 0
+                    """
+                )
+        return before, self.open_position_count()
+
     def save_position(self, position: Position) -> None:
         with self.session() as conn:
             conn.execute(
@@ -720,6 +778,60 @@ class Storage:
                     position.direction,
                     position.leverage,
                     position.margin_mode,
+                ),
+            )
+
+    def save_exchange_order_snapshot(self, row: dict, market_type: str) -> None:
+        import json
+
+        symbol = str(row.get("instId") or "")
+        if not symbol:
+            return
+        client_order_id = str(row.get("clOrdId") or row.get("ordId") or "")
+        if not client_order_id:
+            return
+        side = str(row.get("side") or "").lower() or "buy"
+        order_type = str(row.get("ordType") or "unknown").lower()
+        status = _state_from_raw(row) or "pending"
+        filled_size = _float_or_zero(row.get("accFillSz") or row.get("fillSz"))
+        avg_fill_price = _float_or_none(row.get("avgPx") or row.get("fillPx"))
+        size = _float_or_zero(row.get("sz"))
+        price = _float_or_none(row.get("px"))
+        pos_side = row.get("posSide")
+        direction = str(pos_side or "long")
+        if direction in {"net", ""}:
+            direction = "short" if side == "sell" and str(market_type).upper() != "SPOT" else "long"
+        td_mode = str(row.get("tdMode") or ("cash" if str(market_type).upper() == "SPOT" else "isolated"))
+        reduce_only = str(row.get("reduceOnly") or "").lower() == "true"
+        leverage = _float_or_zero(row.get("lever")) or 1.0
+        with self.session() as conn:
+            conn.execute(
+                """
+                insert or replace into orders(
+                    symbol, market_type, direction, td_mode, pos_side, reduce_only, leverage,
+                    side, size, order_type, price, client_order_id, exchange_order_id,
+                    ok, reason, error, raw, status, filled_size, avg_fill_price, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, '', ?, ?, ?, ?, current_timestamp)
+                """,
+                (
+                    symbol,
+                    str(market_type).upper(),
+                    direction,
+                    td_mode,
+                    pos_side,
+                    int(reduce_only),
+                    leverage,
+                    side,
+                    size,
+                    order_type,
+                    price,
+                    client_order_id,
+                    row.get("ordId"),
+                    "okx_sync",
+                    json.dumps(row, ensure_ascii=False),
+                    status,
+                    filled_size,
+                    avg_fill_price,
                 ),
             )
 
@@ -962,6 +1074,35 @@ class Storage:
             f"重试={retry_count}; 平均{avg_ms:.0f}ms"
             f"{error_tail}"
         )
+
+    def recent_ai_call_breakdown(self, limit: int = 200) -> str:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select intent, ok, action, total_tokens, attempted_tokens, error
+                from ai_call_audits
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        if not rows:
+            return "AI去向: 暂无"
+        buckets: dict[str, dict[str, int]] = {}
+        for row in rows:
+            intent = str(row["intent"] or "unknown")
+            if row["error"] and "JSON" in str(row["error"]).upper():
+                intent = "parse_failed"
+            bucket = buckets.setdefault(intent, {"count": 0, "ok": 0, "tokens": 0, "attempted": 0})
+            bucket["count"] += 1
+            bucket["ok"] += int(row["ok"])
+            bucket["tokens"] += int(row["total_tokens"] or 0)
+            bucket["attempted"] += int(row["attempted_tokens"] or 0)
+        parts = [
+            f"{intent}={values['count']}次/{values['tokens']}token"
+            for intent, values in sorted(buckets.items(), key=lambda item: item[1]["count"], reverse=True)
+        ]
+        return "AI去向: " + "; ".join(parts[:8])
 
     def add_training_usage(
         self,

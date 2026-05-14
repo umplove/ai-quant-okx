@@ -149,6 +149,30 @@ class _StopLossFailExchange(_TradingExchange):
         return StopLossOrder(symbol, None, f"SL{symbol}", stop_price, size, False, {}, "stop rejected")
 
 
+class _SyncExchange(_TradingExchange):
+    def __init__(self, tickers, details=None, positions=None, open_orders=None):
+        super().__init__(tickers)
+        self.details = details or []
+        self.positions = positions or []
+        self.open_orders = open_orders or []
+
+    def get_balance(self, currency=None):
+        return {"data": [{"totalEq": "95106.17", "details": self.details}]}
+
+    def get_positions(self, inst_type=None, symbol=None):
+        rows = [
+            row
+            for row in self.positions
+            if (not inst_type or row.get("instType") == inst_type)
+            and (not symbol or row.get("instId") == symbol)
+        ]
+        return {"code": "0", "data": rows}
+
+    def list_open_orders(self, symbol=None, inst_type="SPOT"):
+        rows = [row for row in self.open_orders if row.get("instType", "SPOT") == inst_type]
+        return {"code": "0", "data": rows}
+
+
 class MomentumRunnerTests(unittest.TestCase):
     def test_tradable_candidates_fill_available_slots(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -243,7 +267,7 @@ class MomentumRunnerTests(unittest.TestCase):
             self.assertEqual(exchange.sell_calls, ["AAA-USDT"])
             self.assertFalse(storage.get_position("AAA-USDT").is_open)
 
-    def test_full_book_still_asks_ai_for_learning(self):
+    def test_full_book_skips_buy_ai_and_manages_positions_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "bot.sqlite3"
             storage = Storage(db)
@@ -264,8 +288,54 @@ class MomentumRunnerTests(unittest.TestCase):
                 client.return_value.decide_buy.return_value = _decision("buy")
                 runner.run_once()
 
-            self.assertEqual(client.return_value.decide_buy.call_count, 2)
+            self.assertEqual(client.return_value.decide_buy.call_count, 0)
+            self.assertIn("持仓已满", storage.get_state("last_buy_ai_skip_reason"))
             self.assertEqual(exchange.buy_calls, [])
+
+    def test_okx_sync_replaces_local_positions_and_alerts_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            symbols = tuple(f"AAA{i}-USDT" for i in range(7))
+            tickers = [MarketTicker(symbol, 2, 1, 2, 1, 1000, 1) for symbol in symbols]
+            details = [
+                {"ccy": symbol.split("-")[0], "eq": "1", "eqUsd": "2", "availBal": "1"}
+                for symbol in symbols
+            ]
+            settings = _trading_settings(db, symbols, max_open_positions=10)
+            exchange = _SyncExchange(tickers, details=details)
+            notifier = _Notifier()
+            runner = MomentumBotRunner(settings, storage, exchange, notifier)
+            scan = MomentumScan(tickers=tickers, info_signals=[], candidates=[])
+
+            runner._sync_exchange_state(scan)
+
+            self.assertEqual(storage.open_position_count(), 7)
+            self.assertEqual(storage.get_state("okx_last_position_count"), "7")
+            self.assertIn("OKX持仓 != 本地持仓", notifier.messages[-1])
+
+    def test_buy_ai_candidates_are_capped_by_available_slots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            symbols = tuple(f"AAA{i}-USDT" for i in range(12))
+            for symbol in symbols[:7]:
+                storage.save_position(Position(symbol, 1, 2, 2))
+            settings = _trading_settings(db, symbols, max_open_positions=10)
+            settings = settings.__class__(**{**settings.__dict__, "ai_review_max_candidates": 10})
+            candidates = [
+                CandidateScore(symbol, 2, 1, 1, 1000, 0, 0, 10 - idx, "test", True)
+                for idx, symbol in enumerate(symbols)
+            ]
+            scan = MomentumScan(tickers=[], info_signals=[], candidates=candidates)
+            runner = MomentumBotRunner(settings, storage, _TradingExchange([]), _Notifier())
+
+            selected = runner._ai_learning_candidates(scan)
+
+            self.assertEqual(len(selected), 4)
+            self.assertIn("最多审核4", storage.get_state("last_buy_ai_skip_reason"))
 
     def test_stop_loss_failure_is_recorded_without_symbol_pause(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -299,7 +369,7 @@ class MomentumRunnerTests(unittest.TestCase):
 
             runner._send_money_report(force=True)
             self.assertEqual(len(notifier.messages), 1)
-            self.assertIn("总资产", notifier.messages[0])
+            self.assertIn("OKX总权益", notifier.messages[0])
 
     def test_manual_ai_and_training_messages_are_chinese(self):
         with tempfile.TemporaryDirectory() as tmp:
