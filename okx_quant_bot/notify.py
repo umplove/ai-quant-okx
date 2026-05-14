@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.parse
 import urllib.request
 
@@ -61,17 +62,27 @@ class Notifier:
             return False
 
     def poll_controls(self, storage) -> list[str]:
-        if not (
-            self.settings.telegram_controls_enabled
-            and self.settings.telegram_bot_token
-            and self.settings.telegram_chat_id
-        ):
+        now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+        try:
+            storage.set_state("telegram_poll_started_at", now)
+        except Exception:
+            pass
+        if not (self.settings.telegram_bot_token and self.settings.telegram_chat_id):
+            try:
+                storage.set_state("telegram_poll_status", "disabled_missing_token_or_chat_id")
+            except Exception:
+                pass
             return []
         try:
-            return self._poll_controls(storage)
+            actions = self._poll_controls(storage)
+            storage.set_state("telegram_poll_status", f"ok actions={len(actions)}")
+            storage.set_state("telegram_poll_finished_at", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
+            return actions
         except Exception as exc:
             self.last_error = str(exc)
             try:
+                storage.set_state("telegram_poll_status", f"error: {str(exc)[:200]}")
+                storage.set_state("telegram_poll_finished_at", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
                 storage.save_bot_error("telegram_poll", "Telegram轮询失败", str(exc))
             except Exception:
                 pass
@@ -85,14 +96,21 @@ class Notifier:
         actions: list[str] = []
         with urllib.request.urlopen(request, timeout=10) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        for update in payload.get("result", []):
+        updates = payload.get("result", [])
+        storage.set_state("telegram_last_update_count", str(len(updates)))
+        for update in updates:
             update_id = int(update.get("update_id", 0))
             storage.set_state("telegram_update_offset", str(update_id + 1))
             message = update.get("message") or {}
             text = str(message.get("text") or "").strip().split(maxsplit=1)[0].lower()
             chat_id = str((message.get("chat") or {}).get("id") or "")
+            storage.set_state("telegram_last_update_id", str(update_id))
+            storage.set_state("telegram_last_update_text", text[:80])
+            storage.set_state("telegram_last_update_chat_id", chat_id)
             if chat_id and chat_id != str(self.settings.telegram_chat_id):
+                storage.set_state("telegram_last_update_ignored_reason", "chat_id_mismatch")
                 continue
+            storage.set_state("telegram_last_update_ignored_reason", "")
             if text == "/stop":
                 storage.set_state("bot_paused", "1")
                 actions.append("stopped")

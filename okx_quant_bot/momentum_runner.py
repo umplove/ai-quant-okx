@@ -38,11 +38,11 @@ class MomentumBotRunner:
         self.storage.init()
         self._mark_runtime_started()
         self._save_config_snapshot()
+        self._start_control_thread()
         self.notifier.setup_commands()
         if self.training_pool is None:
             self.training_pool = AiTrainingPool(self.settings, self.storage)
         self.training_pool.start()
-        self._start_control_thread()
         if self.settings.telegram_auto_reports:
             self._send_startup_diagnostics()
             self._send_money_report(force=True)
@@ -1361,11 +1361,8 @@ class MomentumBotRunner:
                 self.notifier.send(self._market_message())
 
     def _start_control_thread(self) -> None:
-        if not (
-            self.settings.telegram_controls_enabled
-            and self.settings.telegram_bot_token
-            and self.settings.telegram_chat_id
-        ):
+        if not (self.settings.telegram_bot_token and self.settings.telegram_chat_id):
+            self.storage.set_state("telegram_control_thread", "disabled_missing_token_or_chat_id")
             return
         if self._controls_thread is not None and self._controls_thread.is_alive():
             return
@@ -1377,6 +1374,7 @@ class MomentumBotRunner:
         )
         self._controls_thread.start()
         self.storage.set_state("telegram_control_thread", "running")
+        print("Telegram control thread started")
 
     def _control_thread_loop(self) -> None:
         while not self._controls_stop.is_set():
@@ -1542,6 +1540,7 @@ class MomentumBotRunner:
         stage_at = self.storage.get_state("runtime_stage_updated_at", "")
         control_thread = self.storage.get_state("telegram_control_thread", "stopped")
         control_poll_at = self.storage.get_state("telegram_control_last_poll_at", "")
+        poll_status = self.storage.get_state("telegram_poll_status", "")
         db_status = "正常"
         try:
             self.storage.open_position_count()
@@ -1552,6 +1551,7 @@ class MomentumBotRunner:
                 "健康状态:",
                 f"DB: {db_status}",
                 f"Telegram control thread: {control_thread} {control_poll_at}",
+                f"Telegram poll: {poll_status}",
                 f"Telegram: {'正常' if not getattr(self.notifier, 'last_error', '') else '异常: ' + self.notifier.last_error[:120]}",
                 f"AI配置: {warning or '正常'}",
                 f"AI后台决策: pending={pending_ai}",

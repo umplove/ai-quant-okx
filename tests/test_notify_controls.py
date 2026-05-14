@@ -79,6 +79,29 @@ class NotifyControlsTests(unittest.TestCase):
             )
             self.assertEqual(storage.get_state("bot_paused"), "0")
             self.assertEqual(storage.get_state("telegram_update_offset"), "23")
+            self.assertEqual(storage.get_state("telegram_poll_status"), "ok actions=13")
+            self.assertEqual(storage.get_state("telegram_last_update_chat_id"), "123")
+
+    def test_poll_controls_still_works_when_menu_controls_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            settings = settings_for(db)
+            settings = settings.__class__(
+                **{
+                    **settings.__dict__,
+                    "telegram_bot_token": "token",
+                    "telegram_chat_id": "123",
+                    "telegram_controls_enabled": False,
+                }
+            )
+            payload = {"result": [{"update_id": 10, "message": {"text": "/status", "chat": {"id": 123}}}]}
+            with patch("urllib.request.urlopen", return_value=_Response(payload)):
+                actions = Notifier(settings).poll_controls(storage)
+
+            self.assertEqual(actions, ["status"])
+            self.assertEqual(storage.get_state("telegram_poll_status"), "ok actions=1")
 
     def test_setup_commands_registers_function_panel(self):
         captured = {}
