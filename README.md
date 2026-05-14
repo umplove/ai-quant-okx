@@ -155,11 +155,11 @@ TRADING_ENABLED=true
 ALLOW_LIVE_TRADING=false
 ```
 
-即使你误改了部分配置，只要这个仍是 `false`，程序不会允许实盘模式启动。
+即使误改了部分配置，只要这个仍是 `false`，程序不会允许实盘模式启动。
 
 ### 模拟盘疯狂训练模式
 
-你当前的目标是前期用模拟盘疯狂积累经验，所以推荐：
+当前的目标是前期用模拟盘疯狂积累经验，所以推荐：
 
 ```env
 RISK_HALT_ENABLED=false
@@ -211,7 +211,7 @@ TRAILING_STOP_PCT=0.01
 
 ## AI 配置
 
-### 小米 MiMo 推荐配置
+### 推荐配置
 
 ```env
 AI_REVIEW_ENABLED=true
@@ -222,7 +222,7 @@ AI_REVIEW_TIMEOUT_SECONDS=20
 AI_REQUEST_RETRIES=2
 AI_RETRY_BACKOFF_SECONDS=1.5
 
-OPENAI_API_KEY=你的小米MiMo API Key
+OPENAI_API_KEY=你的 API Key
 OPENAI_MODEL=mimo-v2.5-pro
 OPENAI_BASE_URL=https://api.xiaomimimo.com/v1
 OPENAI_API_MODE=chat
@@ -423,7 +423,7 @@ TELEGRAM_AUTO_REPORTS=false
 MONEY_REPORT_INTERVAL_SCANS=1
 ```
 
-`TELEGRAM_AUTO_REPORTS=false` 表示不每轮自动刷资金报表。你需要时点菜单或发命令查看。
+`TELEGRAM_AUTO_REPORTS=false` 表示不每轮自动刷资金报表。需要时点菜单或发命令查看。
 
 ### 命令
 
@@ -638,17 +638,5 @@ docker compose logs -f
 - OKX 限价、撤单、挂单查询接口。
 - 中文输出乱码回归。
 
-当前本地回归结果：
 
-```text
-65 tests OK
-```
-
-## 重要提醒
-
-- `.env` 不要提交到 GitHub。
-- 你之前贴出的 OKX、Telegram、AI key 建议全部轮换。
-- 服务器上的 `.env` 才决定真实运行参数，本地 `.env.example` 只是模板。
-- 如果目标是前一周疯狂训练，重点看 `/training`、`/ai`、`/lessons`、`/execution` 四个菜单。
-- 如果长时间 `AI调用: 0/x成功` 且最近错误是 timeout，优先检查服务器到 `https://api.xiaomimimo.com/v1` 的网络、DNS、代理和 MiMo key。
 
