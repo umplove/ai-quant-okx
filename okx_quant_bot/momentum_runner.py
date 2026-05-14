@@ -1268,7 +1268,12 @@ class MomentumBotRunner:
         self.storage.set_state("money_report_scan_count", str(count))
         if scan is not None and count % self.settings.money_report_interval_scans != 0:
             return
-        snapshot = self._money_snapshot()
+        try:
+            snapshot = self._money_snapshot()
+        except Exception as exc:
+            self.storage.save_bot_error("money_report", "资金快照失败，使用缓存状态回复", str(exc))
+            snapshot = self._cached_money_snapshot()
+            note = f"{note}\nOKX资金快照失败，已使用缓存状态: {exc}".strip()
         sync_status = self.storage.get_state("okx_sync_status", "OKX同步未运行")
         okx_position_count = self.storage.get_state("okx_last_position_count", str(self.storage.open_position_count()))
         message = "\n".join(
@@ -1321,6 +1326,25 @@ class MomentumBotRunner:
             "equity": equity,
             "available": account["available"],
             "occupied": account["occupied"],
+            "daily_pnl": daily_pnl,
+            "pnl": pnl,
+            "return_pct": return_pct,
+        }
+
+    def _cached_money_snapshot(self) -> dict[str, float]:
+        equity = _float_or_zero(self.storage.get_state("okx_account_equity", "10000"))
+        available = _float_or_zero(self.storage.get_state("okx_account_available", str(equity)))
+        occupied = _float_or_zero(self.storage.get_state("okx_account_occupied", "0"))
+        baseline = _float_or_zero(self.storage.get_state("money_baseline_equity", str(equity))) or equity
+        daily_key = f"money_daily_baseline:{utc_day()}"
+        daily_baseline = _float_or_zero(self.storage.get_state(daily_key, str(equity))) or equity
+        pnl = equity - baseline
+        daily_pnl = equity - daily_baseline
+        return_pct = 0.0 if baseline <= 0 else pnl / baseline * 100.0
+        return {
+            "equity": equity,
+            "available": available,
+            "occupied": occupied,
             "daily_pnl": daily_pnl,
             "pnl": pnl,
             "return_pct": return_pct,

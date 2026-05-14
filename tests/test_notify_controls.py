@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import URLError
+from urllib.parse import parse_qs
 
 from okx_quant_bot.data import Storage
 from okx_quant_bot.notify import Notifier
@@ -159,6 +160,30 @@ class NotifyControlsTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertIn("timeout", notifier.last_error)
+
+    def test_send_splits_long_messages(self):
+        captured = []
+
+        def fake_urlopen(request, timeout):
+            captured.append(parse_qs(request.data.decode("utf-8"))["text"][0])
+            return _Response({"ok": True})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = settings_for(Path(tmp) / "bot.sqlite3")
+            settings = settings.__class__(
+                **{
+                    **settings.__dict__,
+                    "telegram_bot_token": "token",
+                    "telegram_chat_id": "123",
+                }
+            )
+            long_message = "header\n" + ("x" * 4100)
+            with patch("urllib.request.urlopen", fake_urlopen):
+                ok = Notifier(settings).send(long_message)
+
+        self.assertTrue(ok)
+        self.assertGreater(len(captured), 1)
+        self.assertTrue(all(len(part) <= 3900 for part in captured))
 
 
 if __name__ == "__main__":

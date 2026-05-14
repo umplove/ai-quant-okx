@@ -8,6 +8,9 @@ import urllib.request
 from okx_quant_bot.config import Settings
 
 
+MAX_TELEGRAM_MESSAGE_CHARS = 3900
+
+
 class Notifier:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -23,7 +26,7 @@ class Notifier:
             return True
         except Exception as exc:
             self.last_error = str(exc)
-            print(f"Telegram发送失败: {exc}")
+            print(f"Telegram send failed: {exc}", flush=True)
             return False
 
     def send_money(self, message: str) -> bool:
@@ -33,19 +36,19 @@ class Notifier:
         if not (self.settings.telegram_controls_enabled and self.settings.telegram_bot_token):
             return False
         commands = [
-            {"command": "status", "description": "查看资产、持仓和最近订单"},
-            {"command": "ai", "description": "查看AI配置、调用和错误统计"},
-            {"command": "positions", "description": "查看当前持仓和AI最近卖出意见"},
-            {"command": "training", "description": "查看本周AI训练token进度"},
-            {"command": "health", "description": "查看线程、DB、Telegram和配置健康状态"},
-            {"command": "errors", "description": "查看最近异常、timeout和下单失败"},
-            {"command": "shadow", "description": "查看影子全市场最近建议"},
-            {"command": "execution", "description": "查看最近AI执行决策和订单方式"},
-            {"command": "lessons", "description": "查看最近交易归因和经验"},
-            {"command": "market", "description": "查看当前AI行情状态"},
-            {"command": "stop", "description": "暂停交易主循环"},
-            {"command": "start", "description": "恢复交易主循环"},
-            {"command": "reset", "description": "重置资金统计"},
+            {"command": "status", "description": "Show account, positions and recent orders"},
+            {"command": "ai", "description": "Show AI config, calls and errors"},
+            {"command": "positions", "description": "Show current positions"},
+            {"command": "training", "description": "Show AI training token progress"},
+            {"command": "health", "description": "Show runtime health"},
+            {"command": "errors", "description": "Show recent errors"},
+            {"command": "shadow", "description": "Show legacy shadow decisions"},
+            {"command": "execution", "description": "Show AI execution decisions and orders"},
+            {"command": "lessons", "description": "Show trade lessons and attribution"},
+            {"command": "market", "description": "Show AI market regime"},
+            {"command": "stop", "description": "Pause trading loop"},
+            {"command": "start", "description": "Resume trading loop"},
+            {"command": "reset", "description": "Reset money baseline"},
         ]
         try:
             token = self.settings.telegram_bot_token
@@ -58,7 +61,7 @@ class Notifier:
             return True
         except Exception as exc:
             self.last_error = str(exc)
-            print(f"Telegram菜单设置失败: {exc}")
+            print(f"Telegram menu setup failed: {exc}", flush=True)
             return False
 
     def poll_controls(self, storage) -> list[str]:
@@ -84,7 +87,7 @@ class Notifier:
             try:
                 storage.set_state("telegram_poll_status", f"error: {str(exc)[:200]}")
                 storage.set_state("telegram_poll_finished_at", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
-                storage.save_bot_error("telegram_poll", "Telegram轮询失败", str(exc))
+                storage.save_bot_error("telegram_poll", "Telegram poll failed", str(exc))
             except Exception:
                 pass
             return []
@@ -147,7 +150,30 @@ class Notifier:
     def _send_telegram(self, message: str) -> None:
         token = self.settings.telegram_bot_token
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        body = urllib.parse.urlencode({"chat_id": self.settings.telegram_chat_id, "text": message}).encode("utf-8")
-        request = urllib.request.Request(url, data=body, method="POST")
-        with urllib.request.urlopen(request, timeout=10) as response:
-            json.loads(response.read().decode("utf-8"))
+        for chunk in _telegram_message_chunks(message):
+            body = urllib.parse.urlencode({"chat_id": self.settings.telegram_chat_id, "text": chunk}).encode("utf-8")
+            request = urllib.request.Request(url, data=body, method="POST")
+            with urllib.request.urlopen(request, timeout=10) as response:
+                json.loads(response.read().decode("utf-8"))
+
+
+def _telegram_message_chunks(message: str) -> list[str]:
+    if len(message) <= MAX_TELEGRAM_MESSAGE_CHARS:
+        return [message]
+    chunks: list[str] = []
+    current = ""
+    for line in message.splitlines() or [message]:
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= MAX_TELEGRAM_MESSAGE_CHARS:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        while len(line) > MAX_TELEGRAM_MESSAGE_CHARS:
+            chunks.append(line[:MAX_TELEGRAM_MESSAGE_CHARS])
+            line = line[MAX_TELEGRAM_MESSAGE_CHARS:]
+        current = line
+    if current:
+        chunks.append(current)
+    return chunks
