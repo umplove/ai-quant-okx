@@ -325,9 +325,13 @@ class Storage:
             self._ensure_column(conn, "orders", "status", "text not null default 'unknown'")
             self._ensure_column(conn, "orders", "filled_size", "real not null default 0")
             self._ensure_column(conn, "orders", "avg_fill_price", "real")
-            self._ensure_column(conn, "orders", "updated_at", "text default current_timestamp")
+            self._ensure_column(conn, "orders", "updated_at", "text")
             self._ensure_column(conn, "stop_loss_orders", "active", "integer not null default 1")
-            self._ensure_column(conn, "stop_loss_orders", "updated_at", "text default current_timestamp")
+            self._ensure_column(conn, "stop_loss_orders", "updated_at", "text")
+            conn.execute("update orders set updated_at = coalesce(updated_at, created_at, current_timestamp)")
+            conn.execute(
+                "update stop_loss_orders set updated_at = coalesce(updated_at, created_at, current_timestamp)"
+            )
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

@@ -16,6 +16,7 @@
 - `okx_quant_bot/momentum_runner.py` owns momentum execution, pending entry order sync, position updates, and stop-loss replacement.
 - `okx_quant_bot/exchange/okx.py` owns OKX REST calls, client order IDs, instrument precision checks, order placement, cancellation, and stop-loss algo orders.
 - `okx_quant_bot/data/storage.py` owns SQLite schema migration and persistence for orders, positions, stop-loss orders, AI decisions, reports, and audits.
+- SQLite `ALTER TABLE ... ADD COLUMN` migrations must use constant defaults only; timestamp columns are added nullable and backfilled after creation.
 - Pending limit buy orders use local order status fields to prevent duplicate entry orders.
 - Filled or partially filled limit orders are reconciled into positions by incremental filled size only.
 - Active stop-loss records are replaced rather than stacked; full exits cancel active stop-loss records.

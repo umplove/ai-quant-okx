@@ -235,5 +235,6 @@ systemd/               Example service file
 - Keep API keys out of commits. `.env` is ignored by Git.
 - Start with `TRADING_ENABLED=false` until configuration and notifications are verified.
 - Prefer OKX demo trading before live use.
+- Existing SQLite databases are migrated automatically on startup; keep a backup of `data/bot.sqlite3` before major upgrades.
 - Monitor `doctor`, Telegram `/health`, and stored `bot_errors` after deployment.
 - If a server pulls from GitHub, deploy from a reviewed branch or from `main` after tests pass.
