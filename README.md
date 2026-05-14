@@ -1,44 +1,44 @@
 # OKX AI Quant Bot
 
-OKX AI Quant Bot is a Python-based cryptocurrency trading bot for OKX spot, margin, and perpetual swap research workflows. It is designed for demo trading first, with explicit guards before live or leveraged trading can be enabled.
+OKX AI Quant Bot 是一个 Python 量化交易机器人，用于 OKX 现货、杠杆和永续合约研究流程。项目默认优先模拟盘，并在实盘、杠杆和衍生品交易前设置显式安全开关。
 
-The project combines OKX market scanning, momentum scoring, optional AI review, Telegram controls, SQLite persistence, order reconciliation, stop-loss management, and experience scoring. It can be used as a research and automation foundation for multi-market trading experiments.
+项目组合了 OKX 行情扫描、动量评分、可选 AI 审核、Telegram 控制、SQLite 持久化、订单同步、止损管理和经验评分，可作为多市场交易实验和自动化研究基础。
 
-For a detailed code walkthrough, see [docs/CODE_OVERVIEW.md](docs/CODE_OVERVIEW.md).
+详细代码说明见：[docs/CODE_OVERVIEW.md](docs/CODE_OVERVIEW.md)。
 
-## Features
+## 功能
 
-- OKX spot market data, balance checks, market orders, limit orders, cancellation, pending-order queries, and stop-loss algo orders.
-- Optional OKX margin and perpetual swap routing with explicit leverage and derivatives switches.
-- Demo-trading guardrails enabled by default with `OKX_DEMO=true` and `ALLOW_LIVE_TRADING=false`.
-- Momentum candidate ranking from 24h change, amplitude, volume, public information signals, and historical experience.
-- Short-interval momentum mode with default 5-minute scans and up to 5 concurrent positions.
-- Optional AI review for buy, sell, market-regime, execution-mode, and trade-attribution decisions.
-- Background AI training and shadow-market evaluation that do not block the main trading loop.
-- Telegram notifications and command controls for status, AI state, positions, training, health, errors, execution decisions, lessons, and market regime.
-- SQLite storage for candles, orders, positions, stop-loss orders, AI audits, strategy lessons, experience tiers, market intelligence, and runtime errors.
-- Order safety layer for pending limit entries, filled-order reconciliation, incremental position updates, active stop-loss replacement, and OKX precision checks.
-- Standard-library runtime by default; optional WebSocket support can be installed separately.
+- OKX 现货行情、余额查询、市价单、限价单、撤单、pending 订单查询和止损算法单。
+- 可选 OKX 杠杆和永续合约路由，必须显式开启杠杆和衍生品开关。
+- 默认启用模拟盘保护：`OKX_DEMO=true`，`ALLOW_LIVE_TRADING=false`。
+- 根据 24 小时涨跌幅、振幅、成交量、公开信息和历史经验进行动量候选排序。
+- 短线动量模式默认 5 分钟扫描一次，最多 5 个并发仓位。
+- 可选 AI 审核买入、卖出、市场状态、执行模式和交易归因。
+- 后台 AI 训练和影子市场评估，不阻塞主交易循环。
+- Telegram 通知和命令控制，支持状态、AI、仓位、训练、健康、错误、执行决策、经验和市场状态查询。
+- SQLite 存储 candles、orders、positions、stop-loss orders、AI audits、strategy lessons、experience tiers、market intelligence 和 runtime errors。
+- 订单安全层支持 pending 限价入场防重复、成交同步、增量仓位更新、active 止损替换和 OKX 精度校验。
+- 默认只依赖 Python 标准库；WebSocket 支持可选安装。
 
-## Safety Model
+## 安全模型
 
-The bot is conservative by default:
+机器人默认保守：
 
-- `TRADING_ENABLED=false` means scans, AI calls, training, and records can run without sending orders.
-- `OKX_DEMO=true` sends OKX demo-trading requests when trading is enabled.
-- `ALLOW_LIVE_TRADING=false` blocks live trading startup when demo mode is off.
-- Limit buy orders remain pending until OKX reports fills; repeated AI buy decisions do not create duplicate pending entries for the same symbol.
-- Momentum positions use a hard exit guard by default: 3% take profit, 2% stop loss, and 1% trailing pullback protection.
-- AI can suggest earlier exits or stop adjustments, but it cannot disable the hard stop-loss boundary.
-- Stop-loss updates replace active stop-loss records instead of stacking multiple active stops for the same position.
-- Prices and base quantities are rounded using OKX instrument metadata (`tickSz`, `lotSz`, `minSz`) before live submission.
-- Spot execution uses `tdMode=cash`. Margin and perpetual swap execution require `ALLOW_LEVERAGED_TRADING=true` or `ALLOW_DERIVATIVES_TRADING=true` plus `ENABLED_MARKET_TYPES`.
-- Perpetual swap orders set leverage before order placement and use `posSide` plus `reduceOnly` for closing routes. Contract quantities are rounded using swap instrument metadata.
-- AI can run in `rules_first` mode, where confirmed rule-based entries can trade while AI acts as a high-confidence risk veto and attribution engine.
+- `TRADING_ENABLED=false` 时，只扫描、调用 AI、训练和记录，不发送订单。
+- `OKX_DEMO=true` 时，开启交易后向 OKX 模拟盘发送请求。
+- `ALLOW_LIVE_TRADING=false` 会阻止非模拟实盘启动。
+- 限价买入单会一直保持 pending，直到 OKX 返回成交；同一 symbol 的重复 AI 买入不会创建重复 pending 入场单。
+- 动量仓位默认有硬退出：3% 止盈、2% 止损、1% 移动止盈回撤保护。
+- AI 可以建议提前退出或调整止损，但不能取消硬止损边界。
+- 止损更新会替换 active 止损记录，不会给同一个仓位堆叠多个 active 止损。
+- 实盘提交前会用 OKX instrument 元数据规整价格和数量：`tickSz`、`lotSz`、`minSz`。
+- 现货使用 `tdMode=cash`。杠杆和永续需要 `ALLOW_LEVERAGED_TRADING=true` 或 `ALLOW_DERIVATIVES_TRADING=true`，并通过 `ENABLED_MARKET_TYPES` 启用。
+- 永续下单前会设置杠杆，合约单使用 `posSide`，平仓路线使用 `reduceOnly`，合约张数按 instrument 元数据换算。
+- `rules_first` 模式下，规则确认的机会可以先入场，AI 作为高置信风险否决和归因层。
 
-This repository is not investment advice. Review, test, and operate any automated trading system carefully.
+本仓库不是投资建议。任何自动化交易系统都需要自行审查、测试和谨慎运行。
 
-## Installation
+## 安装
 
 ```bash
 git clone https://github.com/umplove/ai-quant-okx.git
@@ -46,21 +46,21 @@ cd ai-quant-okx
 python -m pip install -e .
 ```
 
-Optional WebSocket dependency:
+可选 WebSocket 依赖：
 
 ```bash
 python -m pip install "websockets>=12.0"
 ```
 
-## Configuration
+## 配置
 
-Create a local `.env` file:
+创建本地 `.env`：
 
 ```bash
 cp .env.example .env
 ```
 
-Minimum OKX and runtime settings:
+最小 OKX 和运行配置：
 
 ```env
 OKX_API_KEY=
@@ -76,7 +76,7 @@ SYMBOLS=BTC-USDT,ETH-USDT
 DB_PATH=data/bot.sqlite3
 ```
 
-Optional AI review settings:
+可选 AI 配置：
 
 ```env
 AI_REVIEW_ENABLED=false
@@ -86,7 +86,7 @@ OPENAI_BASE_URL=https://api.xiaomimimo.com/v1
 OPENAI_API_MODE=chat
 ```
 
-Optional Telegram settings:
+可选 Telegram 配置：
 
 ```env
 TELEGRAM_BOT_TOKEN=
@@ -95,39 +95,39 @@ TELEGRAM_CONTROLS_ENABLED=true
 TELEGRAM_AUTO_REPORTS=false
 ```
 
-## Usage
+## 使用
 
-Initialize the database:
+初始化数据库：
 
 ```bash
 python -m okx_quant_bot init-db
 ```
 
-Run a local configuration check without network calls:
+无网络配置检查：
 
 ```bash
 python -m okx_quant_bot doctor --no-network
 ```
 
-Run a network-enabled check:
+带网络配置检查：
 
 ```bash
 python -m okx_quant_bot doctor
 ```
 
-Run one momentum scan:
+单次动量扫描：
 
 ```bash
 python -m okx_quant_bot scan-momentum
 ```
 
-Run the main momentum bot:
+运行动量机器人：
 
 ```bash
 python -m okx_quant_bot run-momentum
 ```
 
-The legacy EMA/RSI runner remains available:
+旧版 EMA/RSI runner 仍可用：
 
 ```bash
 python -m okx_quant_bot run
@@ -135,17 +135,17 @@ python -m okx_quant_bot run
 
 ## Docker
 
-Build and run with Docker Compose:
+使用 Docker Compose 构建和运行：
 
 ```bash
 docker compose up --build
 ```
 
-The Compose file mounts `./data` into the container so SQLite state persists across restarts.
+Compose 会把 `./data` 挂载到容器内，SQLite 状态可跨重启保留。
 
-## Trading Parameters
+## 交易参数
 
-Common settings:
+常用配置：
 
 ```env
 SCAN_INTERVAL_SECONDS=300
@@ -179,7 +179,7 @@ REPLACE_WEAK_POSITION_ENABLED=true
 AI_EXECUTION_DECISIONS_ENABLED=true
 ```
 
-Aggressive multi-market demo experimentation can be configured explicitly:
+激进多市场模拟实验配置：
 
 ```env
 ENABLED_MARKET_TYPES=SPOT,MARGIN,SWAP
@@ -193,9 +193,9 @@ MOMENTUM_ENTRY_MODE=rules_first
 MOMENTUM_ROTATION_MODE=aggressive
 ```
 
-Use demo keys first. Margin and swap routes can amplify losses and may require the OKX account to support the selected margin and position mode.
+建议先使用模拟盘 key。杠杆和永续会放大亏损，并且 OKX 账户需要支持所选保证金模式和持仓模式。
 
-Risk halt settings can be enabled for stricter operation:
+更严格的风险暂停配置：
 
 ```env
 RISK_HALT_ENABLED=true
@@ -203,73 +203,75 @@ MAX_DAILY_LOSS_PCT=0.03
 MAX_CONSECUTIVE_LOSSES=3
 ```
 
-For demo learning and research, `RISK_HALT_ENABLED=false` keeps the bot collecting experience after losses. For more conservative operation, enable it.
+模拟学习和研究场景下，`RISK_HALT_ENABLED=false` 可以让机器人在亏损后继续积累经验。更保守运行时建议开启。
 
-With the defaults above, the momentum runner tries to keep scanning for new opportunities every 5 minutes. If there are fewer than 5 open positions and no duplicate pending entry order for a candidate, eligible symbols can continue entering while existing positions are managed independently.
+默认配置下，动量 runner 每 5 分钟扫描新机会。如果当前仓位少于 5 个，且候选没有同币种 pending 入场单，则符合条件的 symbol 可以继续入场，已有仓位独立管理。
 
-The hard exit guard checks open positions before AI sell decisions:
+硬退出会在 AI 卖出决策前检查：
 
-- `MOMENTUM_TAKE_PROFIT_PCT=0.03`: sell the full spot position near +3%.
-- `MOMENTUM_STOP_LOSS_PCT=0.02`: sell the full spot position near -2%.
-- `MOMENTUM_TRAILING_STOP_PCT=0.01`: after a position has made a new high, sell on a 1% pullback from that high.
+- `MOMENTUM_TAKE_PROFIT_PCT=0.03`：约 +3% 全仓卖出或平仓。
+- `MOMENTUM_STOP_LOSS_PCT=0.02`：约 -2% 全仓卖出或平仓。
+- `MOMENTUM_TRAILING_STOP_PCT=0.01`：创新高后从高点回撤 1% 触发移动止盈。
 
-Telegram `/positions` includes floating PnL plus approximate distance to take-profit and stop-loss levels when a fresh market snapshot is available. `/execution` includes the active hard-exit settings.
+Telegram `/positions` 会在有新行情快照时显示浮盈和距离止盈/止损的大致距离。`/execution` 会显示硬退出和多市场路由配置。
 
-## AI and Training
+## AI 和训练
 
-AI review can provide structured JSON decisions for:
+AI 审核可以输出结构化 JSON 决策：
 
-- Buy or hold decisions for momentum candidates.
-- Sell, partial sell, trail-profit, and breakeven decisions for open positions.
-- Entry mode choices such as market entry, limit pullback, split limit, breakout confirmation, or wait.
-- Size mode choices such as explore, reduced, normal, or strong.
-- Market-regime classification and trade attribution.
+- 动量候选的 buy 或 hold；
+- 持仓的 sell、partial sell、trail profit、breakeven；
+- 入场模式：market、limit pullback、split limit、breakout confirmation、wait；
+- 仓位大小模式：explore、reduced、normal、strong；
+- 市场状态分类；
+- 交易归因。
 
-AI decisions are advisory around the hard guard. They may tighten exits or suggest earlier sells, but the configured hard stop-loss and take-profit checks run first. In `rules_first` mode, AI is a risk veto and attribution layer rather than a required approval gate.
+AI 决策围绕硬风控运行。AI 可以收紧退出或建议提前卖出，但硬止损和硬止盈优先执行。`rules_first` 模式下，AI 是风险否决和归因层，不是买入必需审批。
 
-Experience scoring stores experiment cost, return, PnL, and market direction into tiers: `elite`, `active`, `cooldown`, `rejected`, and `archived`. Live decision context should prefer `elite` and `active` experience while preserving raw trade and audit history for review.
+经验评分会保存试错成本、收益率、PnL 和交易方向，并分成 `elite`、`active`、`cooldown`、`rejected`、`archived`。活跃决策上下文应优先使用 `elite` 和 `active`，同时保留原始交易和审计历史。
 
-Training and audit records include prompt characters, response characters, prompt tokens, completion tokens, total tokens, attempted tokens, retry count, task count, success count, and error count when the provider returns those fields or when the bot can estimate attempts.
+训练和审计记录包括 prompt 字符数、response 字符数、prompt tokens、completion tokens、total tokens、attempted tokens、retry count、task count、success count 和 error count。
 
-## Tests
+## 测试
 
-Compile the package and tests:
+编译包和测试：
 
 ```bash
 python -m compileall -q okx_quant_bot tests
 ```
 
-Run the test suite:
+运行测试套件：
 
 ```bash
 python -m unittest discover -s tests -p "test*.py" -v
 ```
 
-The suite covers AI response parsing, MiMo-compatible request bodies, storage persistence, momentum scoring, order execution modes, limit orders, split orders, partial sells, stop-loss replacement, Telegram controls, OKX spot/margin/swap client behavior, experience scoring, and training-pool accounting.
+测试覆盖 AI 解析、MiMo 兼容请求体、存储持久化、动量评分、订单执行模式、限价单、拆分单、部分卖出、止损替换、Telegram 控制、OKX 现货/杠杆/永续客户端行为、经验评分和训练池统计。
 
-## Project Layout
+## 项目结构
 
 ```text
 okx_quant_bot/
-  ai_reviewer.py       AI request/response parsing and decision helpers
-  cli.py               Command-line entrypoint
-  config.py            Environment loading and safety validation
-  data/storage.py      SQLite schema and persistence helpers
-  exchange/okx.py      OKX REST client and order precision checks
-  momentum.py          Market scanning and candidate scoring
-  momentum_runner.py   Main execution loop and trade safety logic
-  notify.py            Telegram notifications and controls
-  risk.py              Legacy strategy risk controls
-  training.py          Background AI training pool
-tests/                 unittest coverage
-systemd/               Example service file
+  ai_reviewer.py       AI 请求、响应解析和决策辅助
+  cli.py               命令行入口
+  config.py            环境变量加载和安全校验
+  data/storage.py      SQLite schema 和持久化
+  exchange/okx.py      OKX REST 客户端和订单精度校验
+  momentum.py          行情扫描和候选评分
+  momentum_runner.py   主执行循环和交易安全逻辑
+  notify.py            Telegram 通知和控制
+  risk.py              旧策略风险控制
+  training.py          后台 AI 训练池
+tests/                 unittest 测试
+systemd/               systemd 服务示例
+docs/                  项目说明文档
 ```
 
-## Operating Notes
+## 运维注意
 
-- Keep API keys out of commits. `.env` is ignored by Git.
-- Start with `TRADING_ENABLED=false` until configuration and notifications are verified.
-- Prefer OKX demo trading before live use.
-- Existing SQLite databases are migrated automatically on startup; keep a backup of `data/bot.sqlite3` before major upgrades.
-- Monitor `doctor`, Telegram `/health`, and stored `bot_errors` after deployment.
-- If a server pulls from GitHub, deploy from a reviewed branch or from `main` after tests pass.
+- 不要提交 API key。`.env` 已被 Git 忽略。
+- 配置和通知验证前，建议保持 `TRADING_ENABLED=false`。
+- 实盘前优先使用 OKX 模拟盘验证。
+- SQLite 会在启动时自动迁移；重大升级前建议备份 `data/bot.sqlite3`。
+- 部署后关注 `doctor`、Telegram `/health` 和数据库中的 `bot_errors`。
+- 如果服务器从 GitHub 拉取部署，建议使用测试通过后的 `main`。
