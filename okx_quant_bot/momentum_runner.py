@@ -51,7 +51,7 @@ class MomentumBotRunner:
                 self.storage.save_bot_error("main_loop", "主循环异常，机器人会继续运行并等待下一轮。", traceback.format_exc())
                 if self.settings.telegram_auto_reports:
                     self.notifier.send(f"主循环异常，机器人会继续运行并等待下一轮: {exc}")
-            time.sleep(self.settings.scan_interval_seconds)
+            self._sleep_with_controls(self.settings.scan_interval_seconds)
 
     def run_once(self) -> MomentumScan:
         self._exited_symbols = set()
@@ -59,24 +59,34 @@ class MomentumBotRunner:
         self.storage.init()
         self._ensure_runtime_started()
         scan = self._apply_experience_bias(run_momentum_scan(self.settings, self.exchange))
+        self._handle_controls_safely("after_scan")
         self.storage.save_market_snapshots(scan.tickers)
         self.storage.save_info_signals(scan.info_signals)
         self.storage.save_intelligence_items(scan.intelligence_items or [])
         self.storage.save_candidate_scores(scan.candidates)
+        self._handle_controls_safely("after_snapshot")
         sync_note = self._sync_exchange_state(scan)
+        self._handle_controls_safely("after_okx_sync")
         self._sync_pending_entry_orders(scan)
+        self._handle_controls_safely("after_order_sync")
         self._sell_positions_with_hard_exit(scan)
+        self._handle_controls_safely("after_hard_exit")
         self._review_open_trades(scan)
+        self._handle_controls_safely("after_trade_review")
 
         self._collect_finished_ai_tasks()
         market_regime = self._current_market_regime()
         ai_note = self._latest_ai_review_text(scan)
         self._sell_positions_with_recent_ai(scan)
+        self._handle_controls_safely("after_ai_sell_apply")
         self._submit_market_regime(scan)
         self._submit_ai_review(scan)
         self._submit_sell_reviews(scan, market_regime)
+        self._handle_controls_safely("after_ai_submit")
         self._collect_finished_ai_tasks(grace_seconds=0.05)
         self._sell_positions_with_recent_ai(scan)
+        self._handle_controls_safely("after_ai_collect")
+        self._handle_controls_safely("before_ai_buy")
         for candidate in self._ai_learning_candidates(scan):
             self._submit_buy_review(scan, candidate, market_regime)
             self._collect_finished_ai_tasks(grace_seconds=0.05)
@@ -84,9 +94,11 @@ class MomentumBotRunner:
             decision = self._entry_decision(candidate, decision)
             if decision and self._is_tradable_or_replaceable(candidate, decision):
                 self._execute_buy_decision(candidate, decision, scan)
+        self._handle_controls_safely("after_ai_buy")
 
         if self.training_pool is not None:
             self.training_pool.enqueue_scan(scan, self._strategy_context(), self.storage.open_positions())
+        self._handle_controls_safely("after_training_enqueue")
         self._send_money_report(scan=scan, ai_note=ai_note, note=sync_note)
         return scan
 
@@ -1343,6 +1355,24 @@ class MomentumBotRunner:
             elif action == "market":
                 self.notifier.send(self._market_message())
 
+    def _handle_controls_safely(self, stage: str) -> None:
+        self.storage.set_state("runtime_stage", stage)
+        self.storage.set_state("runtime_stage_updated_at", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
+        try:
+            self._handle_controls()
+        except Exception as exc:
+            self.storage.save_bot_error("telegram_controls", f"控制命令处理失败: {stage}", str(exc))
+
+    def _sleep_with_controls(self, seconds: int | float) -> None:
+        remaining = max(0.0, float(seconds))
+        self.storage.set_state("runtime_stage", "sleep")
+        self.storage.set_state("runtime_stage_updated_at", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
+        while remaining > 0:
+            self._handle_controls_safely("sleep")
+            chunk = min(5.0, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+
     def _is_paused(self) -> bool:
         return self.storage.get_state("bot_paused", "0") == "1"
 
@@ -1473,6 +1503,8 @@ class MomentumBotRunner:
         warning = self.settings.ai_config_warning()
         pool_status = self.training_pool.status() if self.training_pool is not None else {}
         pending_ai = sum(1 for future in self._pending_ai.values() if not future.done())
+        stage = self.storage.get_state("runtime_stage", "unknown")
+        stage_at = self.storage.get_state("runtime_stage_updated_at", "")
         db_status = "正常"
         try:
             self.storage.open_position_count()
@@ -1485,6 +1517,7 @@ class MomentumBotRunner:
                 f"Telegram: {'正常' if not getattr(self.notifier, 'last_error', '') else '异常: ' + self.notifier.last_error[:120]}",
                 f"AI配置: {warning or '正常'}",
                 f"AI后台决策: pending={pending_ai}",
+                f"当前阶段: {stage} {stage_at}",
                 self.storage.recent_ai_call_breakdown_since_start(),
                 (
                     "训练池: "

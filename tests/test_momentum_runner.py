@@ -16,9 +16,10 @@ class _Exchange:
 
 
 class _Notifier:
-    def __init__(self):
+    def __init__(self, actions=None):
         self.messages = []
         self.last_error = ""
+        self.actions = list(actions or [])
 
     def send(self, message):
         self.messages.append(message)
@@ -27,7 +28,8 @@ class _Notifier:
         self.messages.append(message)
 
     def poll_controls(self, storage):
-        return []
+        actions, self.actions = self.actions, []
+        return actions
 
     def setup_commands(self):
         pass
@@ -399,6 +401,22 @@ class MomentumRunnerTests(unittest.TestCase):
             runner._send_money_report(force=True)
             self.assertEqual(len(notifier.messages), 1)
             self.assertIn("OKX总权益", notifier.messages[0])
+
+    def test_sleep_polls_manual_status_controls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            settings = settings_for(db)
+            notifier = _Notifier(actions=["status"])
+            runner = MomentumBotRunner(settings, storage, _Exchange(), notifier)
+
+            with patch("okx_quant_bot.momentum_runner.time.sleep"):
+                runner._sleep_with_controls(0.1)
+
+            self.assertTrue(notifier.messages)
+            self.assertIn("OKX总权益", notifier.messages[0])
+            self.assertEqual(storage.get_state("runtime_stage"), "sleep")
 
     def test_manual_ai_and_training_messages_are_chinese(self):
         with tempfile.TemporaryDirectory() as tmp:
