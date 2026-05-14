@@ -22,16 +22,17 @@ class RiskManager:
     ) -> RiskDecision:
         if signal.action != SignalAction.BUY:
             return RiskDecision(True, "not_an_entry")
-        if self._is_paused(signal.symbol):
-            return RiskDecision(False, f"{signal.symbol} is paused")
-        if self._consecutive_losses() >= self.settings.max_consecutive_losses:
-            return RiskDecision(False, "max_consecutive_losses_reached")
-        start_equity = float(self.storage.get_state(self._daily_equity_key(), str(equity)))
-        self.storage.set_state(self._daily_equity_key(), str(start_equity))
-        if start_equity > 0:
-            daily_loss = (start_equity - equity) / start_equity
-            if daily_loss >= self.settings.max_daily_loss_pct:
-                return RiskDecision(False, "max_daily_loss_reached")
+        if self.settings.risk_halt_enabled:
+            if self._is_paused(signal.symbol):
+                return RiskDecision(False, f"{signal.symbol} is paused")
+            if self._consecutive_losses() >= self.settings.max_consecutive_losses:
+                return RiskDecision(False, "max_consecutive_losses_reached")
+            start_equity = float(self.storage.get_state(self._daily_equity_key(), str(equity)))
+            self.storage.set_state(self._daily_equity_key(), str(start_equity))
+            if start_equity > 0:
+                daily_loss = (start_equity - equity) / start_equity
+                if daily_loss >= self.settings.max_daily_loss_pct:
+                    return RiskDecision(False, "max_daily_loss_reached")
         if current_position.market_value(signal.price) >= equity * self.settings.max_symbol_fraction:
             return RiskDecision(False, "symbol_position_limit_reached")
         if cash_balance <= 0:
@@ -61,4 +62,3 @@ class RiskManager:
     @staticmethod
     def _daily_equity_key() -> str:
         return f"daily_start_equity:{date.today().isoformat()}"
-

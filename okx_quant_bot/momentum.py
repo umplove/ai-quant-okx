@@ -161,6 +161,66 @@ class PolymarketSignalClient:
         return signals
 
 
+class OkxSkillSignalClient:
+    """Read-only bridge for exported OKX skill/strategy signals.
+
+    The bot treats these URLs as market intelligence only. They never execute
+    orders and never bypass local risk checks.
+    """
+
+    def __init__(self, urls: Iterable[str], timeout: float = 8.0) -> None:
+        self.urls = tuple(urls)
+        self.timeout = timeout
+
+    def fetch(self, symbols: Iterable[str]) -> list[InfoSignal]:
+        if not self.urls:
+            return []
+        allowed = set(symbols)
+        signals: list[InfoSignal] = []
+        for url in self.urls:
+            try:
+                raw = _http_get(url, timeout=self.timeout)
+                signals.extend(self._parse(raw, url, allowed))
+            except Exception:
+                continue
+        return signals
+
+    def _parse(self, raw: str, url: str, allowed: set[str]) -> list[InfoSignal]:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return self._parse_text(raw, url, allowed)
+        rows = payload if isinstance(payload, list) else payload.get("signals", [])
+        if not isinstance(rows, list):
+            return []
+        signals: list[InfoSignal] = []
+        for row in rows[:100]:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or row.get("instId") or "").upper()
+            if symbol not in allowed:
+                continue
+            title = str(row.get("title") or row.get("signal") or row.get("reason") or "OKX skill signal")
+            try:
+                score = float(row.get("score") or row.get("confidence") or 1.0)
+            except (TypeError, ValueError):
+                score = 1.0
+            signals.append(InfoSignal("okx_skill", symbol, max(-3.0, min(score, 5.0)), title[:240], url))
+        return signals
+
+    def _parse_text(self, raw: str, url: str, allowed: set[str]) -> list[InfoSignal]:
+        signals: list[InfoSignal] = []
+        for line in raw.splitlines()[:100]:
+            text = line.strip()
+            if not text:
+                continue
+            for symbol in allowed:
+                if symbol in text.upper():
+                    signals.append(InfoSignal("okx_skill", symbol, 1.0, text[:240], url))
+                    break
+        return signals
+
+
 class CandidateScorer:
     def __init__(self, require_info_confirmation: bool = False) -> None:
         self.require_info_confirmation = require_info_confirmation
@@ -212,8 +272,9 @@ def run_momentum_scan(settings: Settings, exchange: OkxRestClient) -> MomentumSc
     news_urls = settings.news_rss_urls or (DEFAULT_NEWS_RSS_URLS if settings.news_scan_aggressive else ())
     news_signals = NewsSignalClient(news_urls).fetch(symbols)
     polymarket_signals = PolymarketSignalClient(settings.polymarket_enabled).fetch(symbols)
+    okx_skill_signals = OkxSkillSignalClient(settings.okx_skill_signal_urls).fetch(symbols)
     intelligence_scan = IntelligenceRadar(settings).scan(symbols)
-    info_signals = news_signals + polymarket_signals + intelligence_scan.signals
+    info_signals = news_signals + polymarket_signals + okx_skill_signals + intelligence_scan.signals
     candidates = CandidateScorer(settings.require_info_confirmation).score(tickers, info_signals)
     return MomentumScan(
         tickers=tickers,

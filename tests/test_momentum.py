@@ -7,6 +7,7 @@ from okx_quant_bot.models import InfoSignal, MarketTicker
 from okx_quant_bot.momentum import (
     CandidateScorer,
     MarketScanner,
+    OkxSkillSignalClient,
     _is_crypto_market,
     stop_loss_plan,
     target_position_usdt,
@@ -76,6 +77,17 @@ class MomentumTests(unittest.TestCase):
     def test_polymarket_confirmation_must_match_token(self):
         self.assertTrue(_is_crypto_market("Will Bitcoin hit a new high?", "BTC"))
         self.assertFalse(_is_crypto_market("Will crypto markets rally this week?", "NAVX"))
+
+    def test_okx_skill_signals_are_read_only_info(self):
+        payload = '[{"symbol":"BTC-USDT","score":2.5,"reason":"strategy skill likes momentum"}]'
+        client = OkxSkillSignalClient([])
+
+        signals = client._parse(payload, "https://example.test/skill.json", {"BTC-USDT"})
+
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0].source, "okx_skill")
+        self.assertEqual(signals[0].symbol, "BTC-USDT")
+        self.assertIn("momentum", signals[0].title)
 
     def test_percent_position_size_targets_200_usdt_risk(self):
         with tempfile.TemporaryDirectory() as tmp:

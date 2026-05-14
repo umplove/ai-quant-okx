@@ -75,10 +75,12 @@ class Settings:
     initial_stop_loss_pct: float = 0.20
     fixed_stop_loss_usdt: float = 200.0
     max_open_positions: int = 1
+    risk_halt_enabled: bool = False
     news_rss_urls: tuple[str, ...] = ()
     news_scan_aggressive: bool = True
     intelligence_max_items: int = 30
     trade_review_enabled: bool = True
+    okx_skill_signal_urls: tuple[str, ...] = ()
     polymarket_enabled: bool = True
     binance_square_enabled: bool = False
     require_info_confirmation: bool = False
@@ -94,6 +96,8 @@ class Settings:
     ai_review_enabled: bool = False
     ai_review_interval_scans: int = 1
     ai_review_max_candidates: int = 5
+    ai_always_on: bool = True
+    ai_exploration_fraction: float = 0.20
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -136,10 +140,12 @@ class Settings:
             initial_stop_loss_pct=_float("INITIAL_STOP_LOSS_PCT", 0.20),
             fixed_stop_loss_usdt=_float("FIXED_STOP_LOSS_USDT", 200.0),
             max_open_positions=_int("MAX_OPEN_POSITIONS", 1),
+            risk_halt_enabled=_bool(os.getenv("RISK_HALT_ENABLED"), False),
             news_rss_urls=_csv("NEWS_RSS_URLS"),
             news_scan_aggressive=_bool(os.getenv("NEWS_SCAN_AGGRESSIVE"), True),
             intelligence_max_items=_int("INTELLIGENCE_MAX_ITEMS", 30),
             trade_review_enabled=_bool(os.getenv("TRADE_REVIEW_ENABLED"), True),
+            okx_skill_signal_urls=_csv("OKX_SKILL_SIGNAL_URLS"),
             polymarket_enabled=_bool(os.getenv("POLYMARKET_ENABLED"), False),
             binance_square_enabled=_bool(os.getenv("BINANCE_SQUARE_ENABLED"), False),
             require_info_confirmation=_bool(os.getenv("REQUIRE_INFO_CONFIRMATION"), False),
@@ -155,6 +161,8 @@ class Settings:
             ai_review_enabled=_bool(os.getenv("AI_REVIEW_ENABLED"), False),
             ai_review_interval_scans=_int("AI_REVIEW_INTERVAL_SCANS", 1),
             ai_review_max_candidates=_int("AI_REVIEW_MAX_CANDIDATES", 5),
+            ai_always_on=_bool(os.getenv("AI_ALWAYS_ON"), True),
+            ai_exploration_fraction=_float("AI_EXPLORATION_FRACTION", 0.20),
         )
 
     def require_safe_trading_config(self) -> None:
@@ -186,3 +194,5 @@ class Settings:
             raise ValueError("AI_REVIEW_INTERVAL_SCANS must be positive.")
         if self.ai_review_max_candidates <= 0:
             raise ValueError("AI_REVIEW_MAX_CANDIDATES must be positive.")
+        if self.ai_exploration_fraction < 0 or self.ai_exploration_fraction > 1:
+            raise ValueError("AI_EXPLORATION_FRACTION must be between 0 and 1.")

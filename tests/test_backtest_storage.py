@@ -71,6 +71,17 @@ class BacktestStorageTests(unittest.TestCase):
 
         self.assertEqual([p.symbol for p in positions], ["BTC-USDT"])
 
+    def test_ai_call_audit_summary_records_cost_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp) / "bot.sqlite3")
+            storage.init()
+            storage.save_ai_call_audit("BTC-USDT", "buy", True, "buy", 0.9, 1000, 80, 250, "", "ok")
+
+            summary = storage.recent_ai_call_summary()
+
+        self.assertIn("1/1", summary)
+        self.assertIn("buy=1", summary)
+
 
 if __name__ == "__main__":
     unittest.main()

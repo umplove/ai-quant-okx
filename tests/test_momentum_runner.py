@@ -61,6 +61,11 @@ class _TradingExchange:
         return StopLossOrder(symbol, "algo", f"SL{symbol}", stop_price, size, True, {})
 
 
+class _StopLossFailExchange(_TradingExchange):
+    def place_stop_loss_order(self, symbol, size, stop_price):
+        return StopLossOrder(symbol, None, f"SL{symbol}", stop_price, size, False, {}, "stop rejected")
+
+
 class MomentumRunnerTests(unittest.TestCase):
     def test_tradable_candidates_fill_available_slots(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -179,6 +184,68 @@ class MomentumRunnerTests(unittest.TestCase):
 
             self.assertEqual(exchange.sell_calls, ["AAA-USDT"])
             self.assertFalse(storage.get_position("AAA-USDT").is_open)
+
+    def test_full_book_still_asks_ai_for_learning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            storage.save_position(Position("AAA-USDT", 5, 1, 1))
+            settings = settings_for(db)
+            settings = settings.__class__(
+                **{
+                    **settings.__dict__,
+                    "symbols": ("AAA-USDT", "BBB-USDT"),
+                    "max_open_positions": 1,
+                    "news_scan_aggressive": False,
+                    "ai_review_max_candidates": 2,
+                    "telegram_money_only": True,
+                }
+            )
+            exchange = _TradingExchange(
+                [
+                    MarketTicker("AAA-USDT", 2, 1, 2, 1, 1000, 1),
+                    MarketTicker("BBB-USDT", 2, 1, 2, 1, 900, 1),
+                ]
+            )
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+
+            with patch("okx_quant_bot.momentum_runner.AiReviewClient") as client:
+                client.return_value.decide_sell.return_value = _decision("hold")
+                client.return_value.decide_buy.return_value = _decision("buy")
+                runner.run_once()
+
+            self.assertEqual(client.return_value.decide_buy.call_count, 2)
+            self.assertEqual(exchange.buy_calls, [])
+
+    def test_stop_loss_failure_is_recorded_without_symbol_pause(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            settings = settings_for(db)
+            settings = settings.__class__(
+                **{
+                    **settings.__dict__,
+                    "symbols": ("AAA-USDT",),
+                    "trading_enabled": True,
+                    "okx_api_key": "k",
+                    "okx_secret_key": "s",
+                    "okx_passphrase": "p",
+                    "news_scan_aggressive": False,
+                    "telegram_money_only": True,
+                }
+            )
+            exchange = _StopLossFailExchange([MarketTicker("AAA-USDT", 2, 1, 2, 1, 1000, 1)])
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+
+            with patch("okx_quant_bot.momentum_runner.AiReviewClient") as client:
+                client.return_value.decide_buy.return_value = _decision("buy")
+                client.return_value.decide_sell.return_value = _decision("hold")
+                runner.run_once()
+
+            self.assertEqual(storage.get_state("paused:AAA-USDT", ""), "")
+            self.assertTrue(storage.get_position("AAA-USDT").is_open)
 
 
 def _candidate(symbol: str, confirmed: bool = True) -> CandidateScore:

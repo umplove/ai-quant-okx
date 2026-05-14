@@ -35,6 +35,7 @@ def settings_for(db_path: Path) -> Settings:
         max_consecutive_losses=3,
         telegram_bot_token="",
         telegram_chat_id="",
+        risk_halt_enabled=True,
     )
 
 
@@ -76,7 +77,24 @@ class StrategyRiskTests(unittest.TestCase):
             self.assertFalse(decision.allowed)
             self.assertEqual(decision.reason, "max_daily_loss_reached")
 
+    def test_training_mode_does_not_halt_after_losses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            settings = settings_for(db).__class__(
+                **{**settings_for(db).__dict__, "risk_halt_enabled": False}
+            )
+            risk = RiskManager(settings, storage)
+            for _ in range(10):
+                risk.record_trade_pnl(-1)
+            signal = Signal("BTC-USDT", 1, SignalAction.BUY, 100, "test")
+
+            decision = risk.can_open_position(signal, 1000, 1000, Position("BTC-USDT"))
+
+            self.assertTrue(decision.allowed)
+            self.assertEqual(decision.reason, "risk_ok")
+
 
 if __name__ == "__main__":
     unittest.main()
-

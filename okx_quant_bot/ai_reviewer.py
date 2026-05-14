@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -16,6 +17,9 @@ class AiReview:
     ok: bool
     text: str
     error: str = ""
+    prompt_chars: int = 0
+    response_chars: int = 0
+    duration_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -26,6 +30,9 @@ class AiTradeDecision:
     reason: str = ""
     raw_text: str = ""
     error: str = ""
+    prompt_chars: int = 0
+    response_chars: int = 0
+    duration_ms: int = 0
 
     @property
     def approved_buy(self) -> bool:
@@ -60,8 +67,15 @@ class AiReviewClient:
         prompt = _scan_prompt(self.settings, scan, open_position_count, strategy_memory)
         result = self._complete(prompt)
         if not result.ok:
-            return AiReview(False, "", result.error)
-        return AiReview(True, _telegram_sized(result.raw_text))
+            return AiReview(False, "", result.error, result.prompt_chars, result.response_chars, result.duration_ms)
+        return AiReview(
+            True,
+            _telegram_sized(result.raw_text),
+            "",
+            result.prompt_chars,
+            result.response_chars,
+            result.duration_ms,
+        )
 
     def decide_buy(
         self,
@@ -87,11 +101,22 @@ class AiReviewClient:
         result = self._complete(prompt)
         if not result.ok:
             return AiTradeDecision(False, error=result.error)
-        return _parse_trade_decision(result.raw_text)
+        parsed = _parse_trade_decision(result.raw_text)
+        return AiTradeDecision(
+            parsed.ok,
+            parsed.action,
+            parsed.confidence,
+            parsed.reason,
+            parsed.raw_text,
+            parsed.error,
+            result.prompt_chars,
+            result.response_chars,
+            result.duration_ms,
+        )
 
     def _complete(self, prompt: str) -> AiTradeDecision:
         if not self.enabled:
-            return AiTradeDecision(False, error="AI is disabled or OPENAI_API_KEY is missing.")
+            return AiTradeDecision(False, error="AI is disabled or OPENAI_API_KEY is missing.", prompt_chars=len(prompt))
         body = self._request_body(prompt)
         request = urllib.request.Request(
             self._request_url(),
@@ -99,22 +124,33 @@ class AiReviewClient:
             method="POST",
             headers=self._headers(),
         )
+        started = time.monotonic()
         try:
             raw = self._opener(request, self.settings.ai_review_timeout_seconds)
+            duration_ms = int((time.monotonic() - started) * 1000)
             payload = json.loads(raw.decode("utf-8"))
             text = _extract_ai_text(payload).strip()
             if not text:
-                return AiTradeDecision(False, error="AI response did not contain output text.")
-            return AiTradeDecision(True, raw_text=text)
+                return AiTradeDecision(
+                    False,
+                    error="AI response did not contain output text.",
+                    prompt_chars=len(prompt),
+                    response_chars=0,
+                    duration_ms=duration_ms,
+                )
+            return AiTradeDecision(True, raw_text=text, prompt_chars=len(prompt), response_chars=len(text), duration_ms=duration_ms)
         except urllib.error.HTTPError as exc:
+            duration_ms = int((time.monotonic() - started) * 1000)
             detail = exc.read().decode("utf-8", errors="replace")[:300]
-            return AiTradeDecision(False, error=f"OpenAI HTTP {exc.code}: {detail}")
+            return AiTradeDecision(False, error=f"OpenAI HTTP {exc.code}: {detail}", prompt_chars=len(prompt), duration_ms=duration_ms)
         except TimeoutError:
-            return AiTradeDecision(False, error="timeout")
+            duration_ms = int((time.monotonic() - started) * 1000)
+            return AiTradeDecision(False, error="timeout", prompt_chars=len(prompt), duration_ms=duration_ms)
         except Exception as exc:
+            duration_ms = int((time.monotonic() - started) * 1000)
             if "timed out" in str(exc).lower():
-                return AiTradeDecision(False, error="timeout")
-            return AiTradeDecision(False, error=f"OpenAI request failed: {exc}")
+                return AiTradeDecision(False, error="timeout", prompt_chars=len(prompt), duration_ms=duration_ms)
+            return AiTradeDecision(False, error=f"OpenAI request failed: {exc}", prompt_chars=len(prompt), duration_ms=duration_ms)
 
     def _request_url(self) -> str:
         if self.settings.openai_api_mode == "anthropic":

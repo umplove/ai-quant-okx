@@ -199,6 +199,21 @@ class Storage:
                     raw text not null,
                     created_at text default current_timestamp
                 );
+
+                create table if not exists ai_call_audits (
+                    id integer primary key autoincrement,
+                    symbol text not null,
+                    intent text not null,
+                    ok integer not null,
+                    action text not null,
+                    confidence real not null,
+                    prompt_chars integer not null,
+                    response_chars integer not null,
+                    duration_ms integer not null,
+                    error text not null,
+                    reason text not null,
+                    created_at text default current_timestamp
+                );
                 """
             )
 
@@ -458,6 +473,22 @@ class Storage:
             for row in rows
         ]
 
+    def recent_strategy_lessons(self, limit: int = 20) -> list[str]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select symbol, pnl_usdt, return_pct, summary
+                from strategy_lessons
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            f"{row['symbol']} pnl={row['pnl_usdt']:+.2f}USDT return={row['return_pct']:+.2f}%: {row['summary']}"
+            for row in rows
+        ]
+
     def save_intelligence_items(self, items: Iterable[IntelligenceItem]) -> None:
         with self.session() as conn:
             conn.executemany(
@@ -538,6 +569,69 @@ class Storage:
                 (symbol, intent, action, confidence, reason[:1000], raw[:4000]),
             )
 
+    def save_ai_call_audit(
+        self,
+        symbol: str,
+        intent: str,
+        ok: bool,
+        action: str = "hold",
+        confidence: float = 0.0,
+        prompt_chars: int = 0,
+        response_chars: int = 0,
+        duration_ms: int = 0,
+        error: str = "",
+        reason: str = "",
+    ) -> None:
+        with self.session() as conn:
+            conn.execute(
+                """
+                insert into ai_call_audits(
+                    symbol, intent, ok, action, confidence, prompt_chars, response_chars,
+                    duration_ms, error, reason
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    symbol,
+                    intent,
+                    int(ok),
+                    action,
+                    confidence,
+                    int(prompt_chars),
+                    int(response_chars),
+                    int(duration_ms),
+                    error[:1000],
+                    reason[:1000],
+                ),
+            )
+
+    def recent_ai_call_summary(self, limit: int = 200) -> str:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select intent, ok, action, prompt_chars, response_chars, duration_ms, error
+                from ai_call_audits
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        if not rows:
+            return "AI调用: 暂无"
+        total = len(rows)
+        ok_count = sum(1 for row in rows if row["ok"])
+        buy_count = sum(1 for row in rows if row["action"] == "buy")
+        sell_count = sum(1 for row in rows if row["action"] == "sell")
+        prompt_chars = sum(int(row["prompt_chars"]) for row in rows)
+        response_chars = sum(int(row["response_chars"]) for row in rows)
+        avg_ms = sum(int(row["duration_ms"]) for row in rows) / total
+        errors = [str(row["error"]) for row in rows if row["error"]]
+        error_tail = f"; 最近错误: {errors[0][:60]}" if errors else ""
+        return (
+            f"AI调用: {ok_count}/{total}成功; buy={buy_count}; sell={sell_count}; "
+            f"输入约{prompt_chars}字; 输出约{response_chars}字; 平均{avg_ms:.0f}ms"
+            f"{error_tail}"
+        )
+
     def recent_ai_decisions(self, limit: int = 12) -> list[str]:
         with self.session() as conn:
             rows = conn.execute(
@@ -553,3 +647,22 @@ class Storage:
             f"{r['symbol']} {r['intent']} -> {r['action']} conf={r['confidence']:.2f}: {r['reason']}"
             for r in rows
         ]
+
+    def symbol_experience_biases(self, limit: int = 200) -> dict[str, float]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select symbol, pnl_usdt, return_pct
+                from strategy_lessons
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        biases: dict[str, float] = {}
+        for idx, row in enumerate(rows):
+            decay = 0.96 ** idx
+            return_pct = max(-5.0, min(float(row["return_pct"]), 5.0))
+            pnl_score = max(-2.0, min(float(row["pnl_usdt"]) / 20.0, 2.0))
+            biases[row["symbol"]] = biases.get(row["symbol"], 0.0) + (return_pct + pnl_score) * decay
+        return {symbol: max(-8.0, min(score, 8.0)) for symbol, score in biases.items()}
