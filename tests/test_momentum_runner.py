@@ -40,6 +40,8 @@ class _TradingExchange:
         self.buy_calls = []
         self.limit_buy_calls = []
         self.sell_calls = []
+        self.cancel_stop_calls = []
+        self.order_details = {}
 
     def get_market_tickers(self, inst_type="SPOT"):
         return self.tickers
@@ -84,6 +86,16 @@ class _TradingExchange:
 
     def place_stop_loss_order(self, symbol, size, stop_price):
         return StopLossOrder(symbol, "algo", f"SL{symbol}{len(self.buy_calls)}", stop_price, size, True, {})
+
+    def cancel_stop_loss_order(self, symbol, algo_id):
+        self.cancel_stop_calls.append((symbol, algo_id))
+        return {"code": "0", "data": [{"algoId": algo_id}]}
+
+    def get_order_details(self, symbol, order_id):
+        return self.order_details.get(
+            order_id,
+            {"code": "0", "data": [{"ordId": order_id, "state": "live", "accFillSz": "0"}]},
+        )
 
 
 class _StopLossFailExchange(_TradingExchange):
@@ -271,6 +283,123 @@ class MomentumRunnerTests(unittest.TestCase):
             self.assertEqual(exchange.buy_calls, [])
             self.assertEqual(len(exchange.limit_buy_calls), 1)
             self.assertFalse(storage.get_position("AAA-USDT").is_open)
+
+    def test_pending_limit_buy_blocks_duplicate_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            settings = _trading_settings(db, ("AAA-USDT",))
+            exchange = _TradingExchange([MarketTicker("AAA-USDT", 2, 1, 2, 1, 1000, 1)])
+            request = OrderRequest("AAA-USDT", Side.BUY, 5, "limit", 1.9, "LBUYAAA", "test")
+            storage.save_order(
+                request,
+                OrderResult(True, "AAA-USDT", Side.BUY, "ord-1", "LBUYAAA", {"data": [{"ordId": "ord-1"}]}),
+                status="pending",
+            )
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+
+            with patch("okx_quant_bot.momentum_runner.AiReviewClient") as client:
+                client.return_value.decide_buy.return_value = _decision("buy")
+                client.return_value.decide_sell.return_value = _decision("hold")
+                runner.run_once()
+
+            self.assertEqual(exchange.buy_calls, [])
+            self.assertEqual(exchange.limit_buy_calls, [])
+            self.assertEqual(len(storage.pending_entry_orders("AAA-USDT")), 1)
+
+    def test_filled_limit_buy_creates_position_and_stop_loss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            settings = _trading_settings(db, ("AAA-USDT",))
+            exchange = _TradingExchange([MarketTicker("AAA-USDT", 2, 1, 2, 1, 1000, 1)])
+            exchange.order_details["ord-1"] = {
+                "code": "0",
+                "data": [{"ordId": "ord-1", "state": "filled", "accFillSz": "5", "avgPx": "2"}],
+            }
+            request = OrderRequest("AAA-USDT", Side.BUY, 5, "limit", 2, "LBUYAAA", "test")
+            storage.save_order(
+                request,
+                OrderResult(True, "AAA-USDT", Side.BUY, "ord-1", "LBUYAAA", {"data": [{"ordId": "ord-1"}]}),
+                status="pending",
+            )
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+
+            with patch("okx_quant_bot.momentum_runner.AiReviewClient") as client:
+                client.return_value.decide_buy.return_value = _decision("buy")
+                client.return_value.decide_sell.return_value = _decision("hold")
+                runner.run_once()
+
+            position = storage.get_position("AAA-USDT")
+            self.assertTrue(position.is_open)
+            self.assertEqual(position.base_qty, 5)
+            self.assertEqual(position.avg_entry_price, 2)
+            self.assertTrue(storage.active_stop_loss_orders("AAA-USDT"))
+
+    def test_partial_fill_only_applies_incremental_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            storage.save_position(Position("AAA-USDT", 2, 2, 2))
+            settings = _trading_settings(db, ("AAA-USDT",))
+            exchange = _TradingExchange([MarketTicker("AAA-USDT", 2, 1, 2, 1, 1000, 1)])
+            exchange.order_details["ord-1"] = {
+                "code": "0",
+                "data": [{"ordId": "ord-1", "state": "partially_filled", "accFillSz": "3", "avgPx": "2"}],
+            }
+            request = OrderRequest("AAA-USDT", Side.BUY, 5, "limit", 2, "LBUYAAA", "test")
+            storage.save_order(
+                request,
+                OrderResult(True, "AAA-USDT", Side.BUY, "ord-1", "LBUYAAA", {"data": [{"ordId": "ord-1"}]}),
+                status="partial",
+                filled_size=2,
+                avg_fill_price=2,
+            )
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+            scan = MomentumScan(tickers=exchange.tickers, info_signals=[], candidates=[])
+
+            runner._sync_pending_entry_orders(scan)
+            runner._sync_pending_entry_orders(scan)
+
+            self.assertEqual(storage.get_position("AAA-USDT").base_qty, 3)
+
+    def test_move_stop_replaces_existing_stop_loss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            storage.save_position(Position("AAA-USDT", 5, 2, 2))
+            storage.save_stop_loss_order(StopLossOrder("AAA-USDT", "algo-old", "SL-OLD", 1.6, 5, True, {}))
+            settings = _trading_settings(db, ("AAA-USDT",))
+            exchange = _TradingExchange([MarketTicker("AAA-USDT", 2, 1, 2, 1, 1000, 1)])
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+
+            runner._move_stop(storage.get_position("AAA-USDT"), 1.9, "test")
+
+            self.assertEqual(exchange.cancel_stop_calls, [("AAA-USDT", "algo-old")])
+            active = storage.active_stop_loss_orders("AAA-USDT")
+            self.assertEqual(len(active), 1)
+            self.assertAlmostEqual(active[0]["stop_price"], 1.9)
+
+    def test_full_sell_cancels_active_stop_loss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            storage.save_position(Position("AAA-USDT", 5, 1, 1))
+            storage.save_stop_loss_order(StopLossOrder("AAA-USDT", "algo-old", "SL-OLD", 0.8, 5, True, {}))
+            settings = _trading_settings(db, ("AAA-USDT",))
+            exchange = _TradingExchange([MarketTicker("AAA-USDT", 2, 1, 2, 1, 1000, 1)])
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+
+            runner._sell_position(storage.get_position("AAA-USDT"), 2, "test")
+
+            self.assertFalse(storage.get_position("AAA-USDT").is_open)
+            self.assertEqual(exchange.cancel_stop_calls, [("AAA-USDT", "algo-old")])
+            self.assertEqual(storage.active_stop_loss_orders("AAA-USDT"), [])
 
     def test_split_limit_places_multiple_orders(self):
         with tempfile.TemporaryDirectory() as tmp:

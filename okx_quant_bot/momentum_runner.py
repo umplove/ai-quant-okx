@@ -56,6 +56,7 @@ class MomentumBotRunner:
         self.storage.save_info_signals(scan.info_signals)
         self.storage.save_intelligence_items(scan.intelligence_items or [])
         self.storage.save_candidate_scores(scan.candidates)
+        self._sync_pending_entry_orders(scan)
         self._review_open_trades(scan)
 
         self._collect_finished_ai_tasks()
@@ -144,6 +145,8 @@ class MomentumBotRunner:
         if candidate.symbol not in set(self.settings.symbols):
             return False
         if not candidate.confirmed:
+            return False
+        if self.storage.pending_entry_orders(candidate.symbol):
             return False
         if self.storage.open_position_count() >= self.settings.max_open_positions:
             return False
@@ -311,6 +314,9 @@ class MomentumBotRunner:
     def _execute_buy_decision(self, candidate: CandidateScore, decision: dict, scan: MomentumScan) -> None:
         if not self._execution_buy_allowed(decision):
             return
+        if self.storage.pending_entry_orders(candidate.symbol):
+            self.storage.save_strategy_lesson(candidate.symbol, 0.0, 0.0, "execution_wait:pending_entry_order", "")
+            return
         if self.storage.open_position_count() >= self.settings.max_open_positions:
             if str(decision.get("replace_mode")) != "replace_weakest":
                 return
@@ -357,9 +363,9 @@ class MomentumBotRunner:
         fill_price = _filled_price(result) or candidate.price
         fill_size = _filled_size(result) or (quote_amount / fill_price if fill_price > 0 else 0.0)
         plan = stop_loss_plan(self.settings, candidate.symbol, fill_price, fill_size * fill_price)
-        self.storage.save_position(Position(candidate.symbol, fill_size, fill_price, fill_price))
-        stop_order = self._place_stop_loss(plan)
-        self.storage.save_stop_loss_order(stop_order)
+        position = Position(candidate.symbol, fill_size, fill_price, fill_price)
+        self.storage.save_position(position)
+        stop_order = self._replace_stop_loss(position, plan.stop_price)
         if not stop_order.ok:
             self._record_execution_failure(candidate.symbol, "止损单失败", stop_order.error or "unknown", stop_order.raw)
 
@@ -408,6 +414,7 @@ class MomentumBotRunner:
         sell_qty = position.base_qty * max(0.0, min(fraction, 1.0))
         if sell_qty <= 0:
             return
+        stop_price = self._current_stop_price(position)
         if not self.settings.trading_enabled:
             request, result = self._dry_run_sell(position, reason, sell_qty)
         else:
@@ -422,9 +429,12 @@ class MomentumBotRunner:
         )
         remaining = position.base_qty - sell_qty
         if remaining > 1e-12:
-            self.storage.save_position(Position(position.symbol, remaining, position.avg_entry_price, max(position.highest_price, current_price)))
+            updated = Position(position.symbol, remaining, position.avg_entry_price, max(position.highest_price, current_price))
+            self.storage.save_position(updated)
+            self._replace_stop_loss(updated, stop_price)
         else:
             self.storage.save_position(Position(symbol=position.symbol))
+            self._cancel_active_stop_losses(position.symbol)
         self.storage.save_strategy_lesson(position.symbol, pnl, return_pct, f"ai_sell:{reason}", str(result.raw))
         self._record_trade_attribution(position.symbol, pnl, return_pct, f"卖出完成: {reason}")
 
@@ -443,12 +453,96 @@ class MomentumBotRunner:
         return not self.storage.get_position(position.symbol).is_open
 
     def _move_stop(self, position: Position, stop_price: float, reason: str) -> None:
-        stop_order = self._place_stop_loss_for_position(position, stop_price)
-        self.storage.save_stop_loss_order(stop_order)
+        stop_order = self._replace_stop_loss(position, stop_price)
         if stop_order.ok:
             self.storage.save_strategy_lesson(position.symbol, 0.0, 0.0, f"{reason}: stop={stop_price:.8g}", str(stop_order.raw))
         else:
             self._record_execution_failure(position.symbol, f"{reason}失败", stop_order.error or "unknown", stop_order.raw)
+
+    def _sync_pending_entry_orders(self, scan: MomentumScan) -> None:
+        if not self.settings.trading_enabled:
+            return
+        prices = {ticker.symbol: ticker.last for ticker in scan.tickers}
+        for order in self.storage.pending_entry_orders():
+            order_id = str(order.get("exchange_order_id") or "")
+            if not order_id:
+                continue
+            symbol = str(order["symbol"])
+            try:
+                payload = self.exchange.get_order_details(symbol, order_id)
+            except Exception as exc:
+                self.storage.save_bot_error("order_sync", f"{symbol} order sync failed", str(exc))
+                continue
+            state = _order_state(payload)
+            filled_size = _filled_size_from_order_payload(payload)
+            avg_price = _filled_price_from_order_payload(payload) or float(order.get("avg_fill_price") or 0.0)
+            previous_size = float(order.get("filled_size") or 0.0)
+            delta_size = max(0.0, filled_size - previous_size)
+            if delta_size > 0:
+                fill_price = avg_price or prices.get(symbol) or float(order.get("price") or 0.0)
+                self._apply_entry_fill(symbol, delta_size, fill_price)
+            if state:
+                self.storage.update_order_fill(
+                    str(order["client_order_id"]),
+                    state,
+                    filled_size,
+                    avg_price if avg_price > 0 else None,
+                    raw=payload,
+                    exchange_order_id=order_id,
+                )
+
+    def _apply_entry_fill(self, symbol: str, fill_size: float, fill_price: float) -> None:
+        if fill_size <= 0 or fill_price <= 0:
+            return
+        current = self.storage.get_position(symbol)
+        if current.is_open:
+            total_size = current.base_qty + fill_size
+            avg_price = ((current.avg_entry_price * current.base_qty) + (fill_price * fill_size)) / total_size
+            position = Position(symbol, total_size, avg_price, max(current.highest_price, fill_price))
+        else:
+            position = Position(symbol, fill_size, fill_price, fill_price)
+        self.storage.save_position(position)
+        plan = stop_loss_plan(self.settings, symbol, position.avg_entry_price, position.base_qty * position.avg_entry_price)
+        stop_order = self._replace_stop_loss(position, plan.stop_price)
+        if not stop_order.ok:
+            self._record_execution_failure(symbol, "stop_loss_failed", stop_order.error or "unknown", stop_order.raw)
+
+    def _replace_stop_loss(self, position: Position, stop_price: float) -> StopLossOrder:
+        if not self._cancel_active_stop_losses(position.symbol):
+            return StopLossOrder(
+                symbol=position.symbol,
+                algo_id=None,
+                client_order_id=OkxRestClient.client_order_id("SLFAIL", position.symbol),
+                stop_price=stop_price,
+                size=position.base_qty,
+                ok=False,
+                raw={},
+                error="failed to cancel existing stop loss",
+            )
+        stop_order = self._place_stop_loss_for_position(position, stop_price)
+        self.storage.save_stop_loss_order(stop_order)
+        return stop_order
+
+    def _cancel_active_stop_losses(self, symbol: str) -> bool:
+        ok = True
+        for order in self.storage.active_stop_loss_orders(symbol):
+            algo_id = str(order.get("algo_id") or "")
+            client_order_id = str(order.get("client_order_id") or "")
+            if self.settings.trading_enabled and algo_id and algo_id != "dry-run":
+                try:
+                    self.exchange.cancel_stop_loss_order(symbol, algo_id)
+                except Exception as exc:
+                    ok = False
+                    self.storage.save_bot_error("stop_loss_cancel", f"{symbol} stop cancel failed", str(exc))
+                    continue
+            self.storage.mark_stop_loss_inactive(client_order_id)
+        return ok
+
+    def _current_stop_price(self, position: Position) -> float:
+        active = self.storage.active_stop_loss_orders(position.symbol)
+        if active:
+            return float(active[0].get("stop_price") or 0.0)
+        return position.avg_entry_price * (1.0 - self.settings.initial_stop_loss_pct)
 
     def _place_stop_loss_for_position(self, position: Position, stop_price: float) -> StopLossOrder:
         if not self.settings.trading_enabled:
@@ -848,3 +942,59 @@ def _filled_size(result: OrderResult) -> float | None:
             return float(value)
     value = result.raw.get("accFillSz")
     return float(value) if value not in {None, ""} else None
+
+
+def _order_state(payload: dict) -> str:
+    first = _order_payload(payload)
+    state = str(first.get("state") or "").lower()
+    mapping = {
+        "live": "pending",
+        "partially_filled": "partial",
+        "partial": "partial",
+        "filled": "filled",
+        "canceled": "canceled",
+        "cancelled": "canceled",
+        "rejected": "rejected",
+    }
+    return mapping.get(state, "")
+
+
+def _filled_size_from_order_payload(payload: dict) -> float:
+    first = _order_payload(payload)
+    for key in ("accFillSz", "fillSz"):
+        value = first.get(key)
+        if value not in {None, ""}:
+            return _float_or_zero(value)
+    return 0.0
+
+
+def _filled_price_from_order_payload(payload: dict) -> float | None:
+    first = _order_payload(payload)
+    for key in ("avgPx", "fillPx"):
+        value = first.get(key)
+        if value not in {None, ""}:
+            return _float_or_none(value)
+    return None
+
+
+def _order_payload(payload: dict) -> dict:
+    data = payload.get("data", [{}])
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0]
+    return payload if isinstance(payload, dict) else {}
+
+
+def _float_or_zero(value: object) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        if value in {None, ""}:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None

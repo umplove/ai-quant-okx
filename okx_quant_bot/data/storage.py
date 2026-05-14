@@ -89,7 +89,11 @@ class Storage:
                     reason text not null,
                     error text,
                     raw text not null,
-                    created_at text default current_timestamp
+                    status text not null default 'unknown',
+                    filled_size real not null default 0,
+                    avg_fill_price real,
+                    created_at text default current_timestamp,
+                    updated_at text default current_timestamp
                 );
 
                 create table if not exists positions (
@@ -155,7 +159,9 @@ class Storage:
                     ok integer not null,
                     raw text not null,
                     error text,
-                    created_at text default current_timestamp
+                    active integer not null default 1,
+                    created_at text default current_timestamp,
+                    updated_at text default current_timestamp
                 );
 
                 create table if not exists daily_reports (
@@ -316,6 +322,12 @@ class Storage:
             self._ensure_column(conn, "ai_call_audits", "attempted_tokens", "integer not null default 0")
             self._ensure_column(conn, "ai_call_audits", "retry_count", "integer not null default 0")
             self._ensure_column(conn, "ai_training_runs", "attempted_tokens", "integer not null default 0")
+            self._ensure_column(conn, "orders", "status", "text not null default 'unknown'")
+            self._ensure_column(conn, "orders", "filled_size", "real not null default 0")
+            self._ensure_column(conn, "orders", "avg_fill_price", "real")
+            self._ensure_column(conn, "orders", "updated_at", "text default current_timestamp")
+            self._ensure_column(conn, "stop_loss_orders", "active", "integer not null default 1")
+            self._ensure_column(conn, "stop_loss_orders", "updated_at", "text default current_timestamp")
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -357,16 +369,26 @@ class Storage:
                 (signal.symbol, signal.ts, signal.action.value, signal.price, signal.reason),
             )
 
-    def save_order(self, request: OrderRequest, result: OrderResult) -> None:
+    def save_order(
+        self,
+        request: OrderRequest,
+        result: OrderResult,
+        status: str | None = None,
+        filled_size: float | None = None,
+        avg_fill_price: float | None = None,
+    ) -> None:
         import json
 
+        order_status = status or _default_order_status(request, result)
+        fill_size = _filled_size_from_raw(result.raw) if filled_size is None else filled_size
+        fill_price = _filled_price_from_raw(result.raw) if avg_fill_price is None else avg_fill_price
         with self.session() as conn:
             conn.execute(
                 """
                 insert or replace into orders(
                     symbol, side, size, order_type, price, client_order_id, exchange_order_id,
-                    ok, reason, error, raw
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ok, reason, error, raw, status, filled_size, avg_fill_price, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
                 """,
                 (
                     request.symbol,
@@ -380,8 +402,67 @@ class Storage:
                     request.reason,
                     result.error,
                     json.dumps(result.raw, ensure_ascii=False),
+                    order_status,
+                    float(fill_size or 0.0),
+                    fill_price,
                 ),
             )
+
+    def update_order_fill(
+        self,
+        client_order_id: str,
+        status: str,
+        filled_size: float,
+        avg_fill_price: float | None,
+        raw: dict | None = None,
+        error: str | None = None,
+        exchange_order_id: str | None = None,
+    ) -> None:
+        import json
+
+        with self.session() as conn:
+            row = conn.execute("select raw from orders where client_order_id = ?", (client_order_id,)).fetchone()
+            raw_text = json.dumps(raw, ensure_ascii=False) if raw is not None else (row["raw"] if row else "{}")
+            conn.execute(
+                """
+                update orders
+                set status = ?, filled_size = ?, avg_fill_price = ?, raw = ?, error = ?,
+                    exchange_order_id = coalesce(?, exchange_order_id),
+                    updated_at = current_timestamp
+                where client_order_id = ?
+                """,
+                (
+                    status,
+                    float(filled_size or 0.0),
+                    avg_fill_price,
+                    raw_text,
+                    error,
+                    exchange_order_id,
+                    client_order_id,
+                ),
+            )
+
+    def pending_entry_orders(self, symbol: str | None = None) -> list[dict]:
+        params: tuple = ()
+        symbol_filter = ""
+        if symbol:
+            symbol_filter = "and symbol = ?"
+            params = (symbol,)
+        with self.session() as conn:
+            rows = conn.execute(
+                f"""
+                select *
+                from orders
+                where side = 'buy'
+                  and order_type = 'limit'
+                  and ok = 1
+                  and status in ('pending', 'partial')
+                  {symbol_filter}
+                order by created_at desc, id desc
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def save_market_snapshots(self, tickers: Iterable[MarketTicker]) -> None:
         with self.session() as conn:
@@ -451,8 +532,8 @@ class Storage:
             conn.execute(
                 """
                 insert or replace into stop_loss_orders(
-                    symbol, algo_id, client_order_id, stop_price, size, ok, raw, error
-                ) values (?, ?, ?, ?, ?, ?, ?, ?)
+                    symbol, algo_id, client_order_id, stop_price, size, ok, raw, error, active, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
                 """,
                 (
                     order.symbol,
@@ -463,7 +544,32 @@ class Storage:
                     int(order.ok),
                     json.dumps(order.raw, ensure_ascii=False),
                     order.error,
+                    int(order.ok),
                 ),
+            )
+
+    def active_stop_loss_orders(self, symbol: str) -> list[dict]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select *
+                from stop_loss_orders
+                where symbol = ? and ok = 1 and active = 1
+                order by created_at desc, id desc
+                """,
+                (symbol,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_stop_loss_inactive(self, client_order_id: str) -> None:
+        with self.session() as conn:
+            conn.execute(
+                """
+                update stop_loss_orders
+                set active = 0, updated_at = current_timestamp
+                where client_order_id = ?
+                """,
+                (client_order_id,),
             )
 
     def save_daily_report(self, report_date: str, summary: str) -> None:
@@ -1069,3 +1175,69 @@ class Storage:
             pnl_score = max(-2.0, min(float(row["pnl_usdt"]) / 20.0, 2.0))
             biases[row["symbol"]] = biases.get(row["symbol"], 0.0) + (return_pct + pnl_score) * decay
         return {symbol: max(-8.0, min(score, 8.0)) for symbol, score in biases.items()}
+
+
+def _default_order_status(request: OrderRequest, result: OrderResult) -> str:
+    if not result.ok:
+        return "rejected"
+    state = _state_from_raw(result.raw)
+    if state:
+        return state
+    if request.order_type == "limit":
+        return "pending"
+    return "filled"
+
+
+def _state_from_raw(raw: dict) -> str:
+    data = raw.get("data", [{}])
+    first = data[0] if isinstance(data, list) and data else raw
+    state = str(first.get("state") or first.get("ordStatus") or "").lower() if isinstance(first, dict) else ""
+    mapping = {
+        "live": "pending",
+        "partially_filled": "partial",
+        "partial": "partial",
+        "filled": "filled",
+        "canceled": "canceled",
+        "cancelled": "canceled",
+        "rejected": "rejected",
+    }
+    return mapping.get(state, "")
+
+
+def _filled_size_from_raw(raw: dict) -> float:
+    data = raw.get("data", [{}])
+    first = data[0] if isinstance(data, list) and data else raw
+    if isinstance(first, dict):
+        for key in ("accFillSz", "fillSz", "filled_size"):
+            value = first.get(key)
+            if value not in {None, ""}:
+                return _float_or_zero(value)
+    value = raw.get("accFillSz")
+    return _float_or_zero(value)
+
+
+def _filled_price_from_raw(raw: dict) -> float | None:
+    data = raw.get("data", [{}])
+    first = data[0] if isinstance(data, list) and data else raw
+    if isinstance(first, dict):
+        for key in ("avgPx", "fillPx", "avg_fill_price"):
+            value = first.get(key)
+            if value not in {None, ""}:
+                return _float_or_none(value)
+    return _float_or_none(raw.get("avgPx"))
+
+
+def _float_or_zero(value: object) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _float_or_none(value: object) -> float | None:
+    try:
+        if value in {None, ""}:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 import hashlib
 import hmac
 import json
@@ -22,10 +24,18 @@ class OkxAPIError(RuntimeError):
 DEFAULT_USER_AGENT = "okx-quant-bot/0.1"
 
 
+@dataclass(frozen=True)
+class InstrumentRules:
+    min_size: float
+    lot_size: float
+    tick_size: float
+
+
 class OkxRestClient:
     def __init__(self, settings: Settings, timeout: float = 10.0) -> None:
         self.settings = settings
         self.timeout = timeout
+        self._instrument_rules: dict[str, InstrumentRules | None] = {}
 
     def get_candles(self, symbol: str, bar: str = "1H", limit: int = 300) -> list[Candle]:
         payload = self._request(
@@ -63,16 +73,27 @@ class OkxRestClient:
         ]
 
     def place_order(self, order: OrderRequest) -> OrderResult:
+        size_text, price_text, error = self._normalized_order_fields(order)
+        if error:
+            return OrderResult(
+                ok=False,
+                symbol=order.symbol,
+                side=order.side,
+                order_id=None,
+                client_order_id=order.client_order_id,
+                raw={"local_validation": True},
+                error=error,
+            )
         body: dict[str, str] = {
             "instId": order.symbol,
             "tdMode": "cash",
             "clOrdId": order.client_order_id,
             "side": order.side.value,
             "ordType": order.order_type,
-            "sz": self._format_float(order.size),
+            "sz": size_text,
         }
-        if order.price is not None:
-            body["px"] = self._format_float(order.price)
+        if price_text is not None:
+            body["px"] = price_text
         if order.target_currency:
             body["tgtCcy"] = order.target_currency
         if order.stop_loss_price is not None:
@@ -197,15 +218,35 @@ class OkxRestClient:
             params["instId"] = symbol
         return self._request("GET", "/api/v5/trade/orders-pending", params=params, auth=True)
 
+    def cancel_stop_loss_order(self, symbol: str, algo_id: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/v5/trade/cancel-algos",
+            body=[{"instId": symbol, "algoId": algo_id}],
+            auth=True,
+        )
+
     def place_stop_loss_order(self, symbol: str, size: float, stop_price: float) -> StopLossOrder:
         client_order_id = self.client_order_id("SL", symbol)
+        size_text, stop_price_text, error = self._normalized_algo_fields(symbol, size, stop_price)
+        if error:
+            return StopLossOrder(
+                symbol=symbol,
+                algo_id=None,
+                client_order_id=client_order_id,
+                stop_price=stop_price,
+                size=size,
+                ok=False,
+                raw={"local_validation": True},
+                error=error,
+            )
         body = {
             "instId": symbol,
             "tdMode": "cash",
             "side": "sell",
             "ordType": "conditional",
-            "sz": self._format_float(size),
-            "slTriggerPx": self._format_float(stop_price),
+            "sz": size_text,
+            "slTriggerPx": stop_price_text,
             "slOrdPx": "-1",
             "slTriggerPxType": "last",
             "algoClOrdId": client_order_id,
@@ -245,12 +286,31 @@ class OkxRestClient:
             auth=True,
         )
 
+    def instrument_rules(self, symbol: str) -> InstrumentRules | None:
+        if symbol in self._instrument_rules:
+            return self._instrument_rules[symbol]
+        rules: InstrumentRules | None = None
+        try:
+            payload = self.get_public_instruments("SPOT")
+            for item in payload.get("data", []):
+                if item.get("instId") == symbol:
+                    rules = InstrumentRules(
+                        min_size=float(item.get("minSz") or 0),
+                        lot_size=float(item.get("lotSz") or 0),
+                        tick_size=float(item.get("tickSz") or 0),
+                    )
+                    break
+        except Exception:
+            rules = None
+        self._instrument_rules[symbol] = rules
+        return rules
+
     def _request(
         self,
         method: str,
         path: str,
         params: dict[str, str] | None = None,
-        body: dict[str, Any] | None = None,
+        body: Any | None = None,
         auth: bool = False,
     ) -> dict[str, Any]:
         method = method.upper()
@@ -303,6 +363,57 @@ class OkxRestClient:
     @staticmethod
     def _format_float(value: float) -> str:
         return f"{value:.12f}".rstrip("0").rstrip(".")
+
+    def _normalized_order_fields(self, order: OrderRequest) -> tuple[str, str | None, str | None]:
+        rules = self.instrument_rules(order.symbol)
+        size = order.size
+        price = order.price
+        size_text = self._format_float(size)
+        price_text = self._format_float(price) if price is not None else None
+        if rules is not None:
+            if price is not None and rules.tick_size > 0:
+                price_text = self._floor_to_step_text(price, rules.tick_size)
+                price = float(price_text)
+                if price <= 0:
+                    return "", None, f"{order.symbol} price is below tick size"
+            rounds_base_size = not (
+                order.side == Side.BUY and order.order_type == "market" and order.target_currency == "quote_ccy"
+            )
+            if rounds_base_size and rules.lot_size > 0:
+                size_text = self._floor_to_step_text(size, rules.lot_size)
+                size = float(size_text)
+                if size <= 0 or (rules.min_size > 0 and size < rules.min_size):
+                    return "", None, f"{order.symbol} size is below minSz={rules.min_size}"
+        return size_text, price_text, None
+
+    def _normalized_algo_fields(self, symbol: str, size: float, stop_price: float) -> tuple[str, str, str | None]:
+        rules = self.instrument_rules(symbol)
+        size_text = self._format_float(size)
+        stop_price_text = self._format_float(stop_price)
+        if rules is not None:
+            if rules.tick_size > 0:
+                stop_price_text = self._floor_to_step_text(stop_price, rules.tick_size)
+                if float(stop_price_text) <= 0:
+                    return "", "", f"{symbol} stop price is below tick size"
+            if rules.lot_size > 0:
+                size_text = self._floor_to_step_text(size, rules.lot_size)
+                rounded_size = float(size_text)
+                if rounded_size <= 0 or (rules.min_size > 0 and rounded_size < rules.min_size):
+                    return "", "", f"{symbol} size is below minSz={rules.min_size}"
+        return size_text, stop_price_text, None
+
+    @staticmethod
+    def _floor_to_step_text(value: float, step: float) -> str:
+        try:
+            value_dec = Decimal(str(value))
+            step_dec = Decimal(str(step))
+            if step_dec <= 0:
+                return OkxRestClient._format_float(value)
+            units = (value_dec / step_dec).to_integral_value(rounding=ROUND_DOWN)
+            rounded = units * step_dec
+            return format(rounded.normalize(), "f").rstrip("0").rstrip(".") or "0"
+        except (InvalidOperation, ValueError):
+            return OkxRestClient._format_float(value)
 
     @staticmethod
     def client_order_id(prefix: str, symbol: str) -> str:

@@ -110,6 +110,52 @@ class OkxRestClientTests(unittest.TestCase):
         self.assertEqual(captured["body"]["px"], "50000")
         self.assertEqual(captured["body"]["sz"], "0.02")
 
+    def test_limit_order_uses_instrument_precision(self):
+        captured = {}
+        responses = [
+            {
+                "code": "0",
+                "data": [{"instId": "BTC-USDT", "minSz": "0.001", "lotSz": "0.001", "tickSz": "0.1"}],
+            },
+            {"code": "0", "data": [{"ordId": "order-1", "sCode": "0"}]},
+        ]
+
+        def fake_urlopen(request, timeout):
+            payload = responses.pop(0)
+            if request.full_url.endswith("/api/v5/trade/order"):
+                captured["body"] = json.loads(request.data.decode("utf-8"))
+            return _JsonResponse(payload)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = OkxRestClient(settings_for(Path(tmp) / "bot.sqlite3"))
+            with patch("urllib.request.urlopen", fake_urlopen):
+                request, result = client.place_limit_buy_quote("BTC-USDT", 1000, 50000.123, "test")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(request.order_type, "limit")
+        self.assertEqual(captured["body"]["px"], "50000.1")
+        self.assertEqual(captured["body"]["sz"], "0.019")
+
+    def test_limit_order_rejects_size_below_minimum(self):
+        responses = [
+            {
+                "code": "0",
+                "data": [{"instId": "BTC-USDT", "minSz": "0.001", "lotSz": "0.001", "tickSz": "0.1"}],
+            }
+        ]
+
+        def fake_urlopen(request, timeout):
+            return _JsonResponse(responses.pop(0))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = OkxRestClient(settings_for(Path(tmp) / "bot.sqlite3"))
+            with patch("urllib.request.urlopen", fake_urlopen):
+                request, result = client.place_limit_buy_quote("BTC-USDT", 10, 50000, "test")
+
+        self.assertEqual(request.order_type, "limit")
+        self.assertFalse(result.ok)
+        self.assertIn("minSz", result.error)
+
     def test_cancel_order_posts_cancel_payload(self):
         captured = {}
         payload = {"code": "0", "data": [{"ordId": "order-1", "sCode": "0"}]}
