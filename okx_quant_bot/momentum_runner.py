@@ -1123,14 +1123,21 @@ class MomentumBotRunner:
             for market_type in ("MARGIN", "SWAP"):
                 if market_type in set(self.settings.enabled_market_types):
                     synced_positions.extend(self._derivative_positions_from_okx(market_type))
+            raw_okx_count = len([position for position in synced_positions if position.is_open])
+            synced_positions = _merge_duplicate_positions(synced_positions)
             before, after = self.storage.replace_open_positions(synced_positions)
             open_order_count = self._sync_open_orders()
             okx_count = len([position for position in synced_positions if position.is_open])
             self.storage.set_state("okx_last_position_count", str(okx_count))
+            duplicate_count = max(0, raw_okx_count - okx_count)
+            self.storage.set_state("okx_raw_position_count", str(raw_okx_count))
+            self.storage.set_state("okx_merged_duplicate_position_count", str(duplicate_count))
             status = (
                 f"OKX同步正常: OKX持仓={okx_count}, 本地同步前={before}, 本地同步后={after}, "
                 f"open_orders={open_order_count}"
             )
+            if duplicate_count > 0:
+                status = f"{status}, OKX原始持仓={raw_okx_count}, 合并重复={duplicate_count}"
             self.storage.set_state("okx_sync_status", status)
             if before != after or okx_count != before:
                 if self.settings.telegram_auto_reports:
@@ -1621,6 +1628,34 @@ def _account_snapshot_from_balance(payload: dict[str, Any]) -> dict[str, float]:
     if occupied <= 0 and equity > available:
         occupied = max(0.0, equity - available)
     return {"equity": equity, "available": available, "occupied": occupied}
+
+
+def _merge_duplicate_positions(positions: list[Position]) -> list[Position]:
+    merged: dict[str, Position] = {}
+    for position in positions:
+        if not position.is_open:
+            continue
+        current = merged.get(position.symbol)
+        if current is None:
+            merged[position.symbol] = position
+            continue
+        total_qty = current.base_qty + position.base_qty
+        if total_qty <= 0:
+            continue
+        avg_entry = (
+            (current.avg_entry_price * current.base_qty) + (position.avg_entry_price * position.base_qty)
+        ) / total_qty
+        merged[position.symbol] = Position(
+            symbol=position.symbol,
+            base_qty=total_qty,
+            avg_entry_price=avg_entry,
+            highest_price=max(current.highest_price, position.highest_price, avg_entry),
+            market_type=current.market_type,
+            direction=current.direction,
+            leverage=max(current.leverage, position.leverage),
+            margin_mode=current.margin_mode,
+        )
+    return list(merged.values())
 
 
 def _spot_symbol(symbol: str) -> str:

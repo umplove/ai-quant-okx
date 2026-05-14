@@ -316,6 +316,34 @@ class MomentumRunnerTests(unittest.TestCase):
             self.assertEqual(notifier.messages, [])
             self.assertIn("OKX同步正常", storage.get_state("okx_sync_status"))
 
+    def test_okx_sync_merges_duplicate_okx_symbols_before_counting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            symbols = ("AAA-USDT", "BBB-USDT")
+            tickers = [
+                MarketTicker("AAA-USDT", 2, 1, 2, 1, 1000, 1),
+                MarketTicker("BBB-USDT", 4, 1, 4, 1, 1000, 1),
+            ]
+            details = [
+                {"ccy": "AAA", "eq": "1", "eqUsd": "2", "availBal": "1"},
+                {"ccy": "AAA", "eq": "2", "eqUsd": "4", "availBal": "2"},
+                {"ccy": "BBB", "eq": "1", "eqUsd": "4", "availBal": "1"},
+            ]
+            settings = _trading_settings(db, symbols, max_open_positions=10)
+            exchange = _SyncExchange(tickers, details=details)
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+            scan = MomentumScan(tickers=tickers, info_signals=[], candidates=[])
+
+            runner._sync_exchange_state(scan)
+
+            self.assertEqual(storage.open_position_count(), 2)
+            self.assertEqual(storage.get_state("okx_last_position_count"), "2")
+            self.assertEqual(storage.get_state("okx_raw_position_count"), "3")
+            self.assertEqual(storage.get_position("AAA-USDT").base_qty, 3)
+            self.assertIn("合并重复=1", storage.get_state("okx_sync_status"))
+
     def test_buy_ai_candidates_are_capped_by_available_slots(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "bot.sqlite3"
