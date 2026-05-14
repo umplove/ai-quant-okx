@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from okx_quant_bot.exchange.okx import DEFAULT_USER_AGENT, OkxRestClient
+from okx_quant_bot.models import Side
 from tests.test_strategy_risk import settings_for
 
 
@@ -190,6 +191,46 @@ class OkxRestClientTests(unittest.TestCase):
         self.assertIn("/api/v5/trade/orders-pending", captured["url"])
         self.assertIn("instType=SPOT", captured["url"])
         self.assertIn("instId=BTC-USDT", captured["url"])
+
+    def test_swap_order_sets_leverage_pos_side_and_reduce_only(self):
+        captured = []
+        responses = [
+            {"code": "0", "data": [{"sCode": "0"}]},
+            {
+                "code": "0",
+                "data": [{"instId": "BTC-USDT-SWAP", "minSz": "1", "lotSz": "1", "tickSz": "0.1", "ctVal": "0.01", "ctValCcy": "BTC"}],
+            },
+            {"code": "0", "data": [{"ordId": "order-1", "sCode": "0"}]},
+        ]
+
+        def fake_urlopen(request, timeout):
+            if request.data:
+                captured.append((request.full_url, json.loads(request.data.decode("utf-8"))))
+            return _JsonResponse(responses.pop(0))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = OkxRestClient(settings_for(Path(tmp) / "bot.sqlite3"))
+            with patch("urllib.request.urlopen", fake_urlopen):
+                request, result = client.place_swap_market(
+                    "BTC-USDT-SWAP",
+                    Side.BUY,
+                    3.9,
+                    "long",
+                    5,
+                    "isolated",
+                    "test",
+                    reduce_only=True,
+                )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(request.market_type, "SWAP")
+        self.assertEqual(captured[0][0].split("?")[0], "https://www.okx.com/api/v5/account/set-leverage")
+        self.assertEqual(captured[0][1]["lever"], "5")
+        self.assertEqual(captured[0][1]["posSide"], "long")
+        self.assertEqual(captured[1][1]["tdMode"], "isolated")
+        self.assertEqual(captured[1][1]["posSide"], "long")
+        self.assertEqual(captured[1][1]["reduceOnly"], "true")
+        self.assertEqual(captured[1][1]["sz"], "3")
 
 class _JsonResponse:
     status = 200

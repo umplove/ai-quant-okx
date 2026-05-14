@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from okx_quant_bot.config import Settings
-from okx_quant_bot.models import Candle, MarketTicker, OrderRequest, OrderResult, Side, StopLossOrder
+from okx_quant_bot.models import Candle, MarketTicker, OrderRequest, OrderResult, Side, StopLossOrder, TradeIntent
 
 
 class OkxAPIError(RuntimeError):
@@ -29,6 +29,8 @@ class InstrumentRules:
     min_size: float
     lot_size: float
     tick_size: float
+    contract_value: float = 0.0
+    contract_value_currency: str = ""
 
 
 class OkxRestClient:
@@ -86,12 +88,16 @@ class OkxRestClient:
             )
         body: dict[str, str] = {
             "instId": order.symbol,
-            "tdMode": "cash",
+            "tdMode": order.td_mode,
             "clOrdId": order.client_order_id,
             "side": order.side.value,
             "ordType": order.order_type,
             "sz": size_text,
         }
+        if order.pos_side:
+            body["posSide"] = order.pos_side
+        if order.reduce_only:
+            body["reduceOnly"] = "true"
         if price_text is not None:
             body["px"] = price_text
         if order.target_currency:
@@ -167,6 +173,87 @@ class OkxRestClient:
         )
         return order, self.place_order(order)
 
+    def set_leverage(self, symbol: str, leverage: float, margin_mode: str, pos_side: str | None = None) -> dict[str, Any]:
+        body = {
+            "instId": symbol,
+            "lever": self._format_float(leverage),
+            "mgnMode": margin_mode,
+        }
+        if pos_side:
+            body["posSide"] = pos_side
+        return self._request("POST", "/api/v5/account/set-leverage", body=body, auth=True)
+
+    def get_positions(self, inst_type: str | None = None, symbol: str | None = None) -> dict[str, Any]:
+        params: dict[str, str] = {}
+        if inst_type:
+            params["instType"] = inst_type
+        if symbol:
+            params["instId"] = symbol
+        return self._request("GET", "/api/v5/account/positions", params=params or None, auth=True)
+
+    def place_trade_intent(self, intent: TradeIntent) -> tuple[OrderRequest, OrderResult]:
+        market_type = intent.market_type.upper()
+        td_mode = "cash" if market_type == "SPOT" else intent.margin_mode
+        pos_side = self._pos_side(intent.direction, market_type)
+        if market_type in {"MARGIN", "SWAP"} and intent.leverage > 0:
+            try:
+                self.set_leverage(intent.symbol, intent.leverage, intent.margin_mode, pos_side if market_type == "SWAP" else None)
+            except Exception as exc:
+                request = self._request_from_intent(intent, td_mode, pos_side)
+                return request, OrderResult(False, intent.symbol, intent.side, None, request.client_order_id, {}, str(exc))
+        request = self._request_from_intent(intent, td_mode, pos_side)
+        return request, self.place_order(request)
+
+    def place_margin_market(
+        self,
+        symbol: str,
+        side: Side,
+        base_size: float,
+        direction: str,
+        leverage: float,
+        margin_mode: str,
+        reason: str,
+        reduce_only: bool = False,
+    ) -> tuple[OrderRequest, OrderResult]:
+        return self.place_trade_intent(
+            TradeIntent(
+                market_type="MARGIN",
+                symbol=symbol,
+                side=side,
+                direction=direction,
+                size=base_size,
+                leverage=leverage,
+                margin_mode=margin_mode,
+                reduce_only=reduce_only,
+                reason=reason,
+            )
+        )
+
+    def place_swap_market(
+        self,
+        symbol: str,
+        side: Side,
+        contract_size: float,
+        direction: str,
+        leverage: float,
+        margin_mode: str,
+        reason: str,
+        reduce_only: bool = False,
+    ) -> tuple[OrderRequest, OrderResult]:
+        return self.place_trade_intent(
+            TradeIntent(
+                market_type="SWAP",
+                symbol=symbol,
+                side=side,
+                direction=direction,
+                size=contract_size,
+                leverage=leverage,
+                margin_mode=margin_mode,
+                reduce_only=reduce_only,
+                reason=reason,
+            )
+        )
+
     def place_limit_buy_quote(
         self,
         symbol: str,
@@ -212,8 +299,8 @@ class OkxRestClient:
             auth=True,
         )
 
-    def list_open_orders(self, symbol: str | None = None) -> dict[str, Any]:
-        params = {"instType": "SPOT"}
+    def list_open_orders(self, symbol: str | None = None, inst_type: str = "SPOT") -> dict[str, Any]:
+        params = {"instType": inst_type}
         if symbol:
             params["instId"] = symbol
         return self._request("GET", "/api/v5/trade/orders-pending", params=params, auth=True)
@@ -286,24 +373,37 @@ class OkxRestClient:
             auth=True,
         )
 
-    def instrument_rules(self, symbol: str) -> InstrumentRules | None:
-        if symbol in self._instrument_rules:
-            return self._instrument_rules[symbol]
+    def instrument_rules(self, symbol: str, inst_type: str = "SPOT") -> InstrumentRules | None:
+        key = f"{inst_type}:{symbol}"
+        if key in self._instrument_rules:
+            return self._instrument_rules[key]
         rules: InstrumentRules | None = None
         try:
-            payload = self.get_public_instruments("SPOT")
+            payload = self.get_public_instruments(inst_type)
             for item in payload.get("data", []):
                 if item.get("instId") == symbol:
                     rules = InstrumentRules(
                         min_size=float(item.get("minSz") or 0),
                         lot_size=float(item.get("lotSz") or 0),
                         tick_size=float(item.get("tickSz") or 0),
+                        contract_value=float(item.get("ctVal") or 0),
+                        contract_value_currency=str(item.get("ctValCcy") or ""),
                     )
                     break
         except Exception:
             rules = None
-        self._instrument_rules[symbol] = rules
+        self._instrument_rules[key] = rules
         return rules
+
+    def swap_contract_size_for_quote(self, symbol: str, quote_amount: float, price: float) -> float:
+        rules = self.instrument_rules(symbol, "SWAP")
+        if price <= 0:
+            return 0.0
+        if rules is None or rules.contract_value <= 0:
+            return quote_amount / price
+        if rules.contract_value_currency.upper() in {"USDT", "USD", "USDC"}:
+            return quote_amount / rules.contract_value
+        return quote_amount / (price * rules.contract_value)
 
     def _request(
         self,
@@ -365,7 +465,7 @@ class OkxRestClient:
         return f"{value:.12f}".rstrip("0").rstrip(".")
 
     def _normalized_order_fields(self, order: OrderRequest) -> tuple[str, str | None, str | None]:
-        rules = self.instrument_rules(order.symbol)
+        rules = self.instrument_rules(order.symbol, order.market_type)
         size = order.size
         price = order.price
         size_text = self._format_float(size)
@@ -377,7 +477,10 @@ class OkxRestClient:
                 if price <= 0:
                     return "", None, f"{order.symbol} price is below tick size"
             rounds_base_size = not (
-                order.side == Side.BUY and order.order_type == "market" and order.target_currency == "quote_ccy"
+                order.market_type == "SPOT"
+                and order.side == Side.BUY
+                and order.order_type == "market"
+                and order.target_currency == "quote_ccy"
             )
             if rounds_base_size and rules.lot_size > 0:
                 size_text = self._floor_to_step_text(size, rules.lot_size)
@@ -387,7 +490,7 @@ class OkxRestClient:
         return size_text, price_text, None
 
     def _normalized_algo_fields(self, symbol: str, size: float, stop_price: float) -> tuple[str, str, str | None]:
-        rules = self.instrument_rules(symbol)
+        rules = self.instrument_rules(symbol, "SPOT")
         size_text = self._format_float(size)
         stop_price_text = self._format_float(stop_price)
         if rules is not None:
@@ -419,3 +522,28 @@ class OkxRestClient:
     def client_order_id(prefix: str, symbol: str) -> str:
         safe_symbol = symbol.replace("-", "")
         return f"{prefix}{safe_symbol}{int(time.time() * 1000)}"[:32]
+
+    @staticmethod
+    def _pos_side(direction: str, market_type: str) -> str | None:
+        if market_type != "SWAP":
+            return None
+        return "short" if direction == "short" else "long"
+
+    @staticmethod
+    def _request_from_intent(intent: TradeIntent, td_mode: str, pos_side: str | None) -> OrderRequest:
+        return OrderRequest(
+            symbol=intent.symbol,
+            side=intent.side,
+            size=intent.size,
+            order_type=intent.order_type,
+            price=intent.price,
+            client_order_id=OkxRestClient.client_order_id("MM", intent.symbol),
+            reason=intent.reason,
+            target_currency=intent.target_currency,
+            market_type=intent.market_type.upper(),
+            td_mode=td_mode,
+            pos_side=pos_side,
+            reduce_only=intent.reduce_only,
+            leverage=intent.leverage,
+            direction=intent.direction,
+        )

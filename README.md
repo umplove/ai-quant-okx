@@ -1,19 +1,20 @@
 # OKX AI Quant Bot
 
-OKX AI Quant Bot is a Python-based cryptocurrency trading bot for OKX spot workflows. It is designed for demo trading first, with explicit guards before live trading can be enabled.
+OKX AI Quant Bot is a Python-based cryptocurrency trading bot for OKX spot, margin, and perpetual swap research workflows. It is designed for demo trading first, with explicit guards before live or leveraged trading can be enabled.
 
-The project combines OKX market scanning, momentum scoring, optional AI review, Telegram controls, SQLite persistence, order reconciliation, and stop-loss management. It can be used as a research and automation foundation for spot trading experiments.
+The project combines OKX market scanning, momentum scoring, optional AI review, Telegram controls, SQLite persistence, order reconciliation, stop-loss management, and experience scoring. It can be used as a research and automation foundation for multi-market trading experiments.
 
 ## Features
 
 - OKX spot market data, balance checks, market orders, limit orders, cancellation, pending-order queries, and stop-loss algo orders.
+- Optional OKX margin and perpetual swap routing with explicit leverage and derivatives switches.
 - Demo-trading guardrails enabled by default with `OKX_DEMO=true` and `ALLOW_LIVE_TRADING=false`.
 - Momentum candidate ranking from 24h change, amplitude, volume, public information signals, and historical experience.
-- Short-interval spot momentum mode with default 5-minute scans and up to 5 concurrent spot positions.
+- Short-interval momentum mode with default 5-minute scans and up to 5 concurrent positions.
 - Optional AI review for buy, sell, market-regime, execution-mode, and trade-attribution decisions.
 - Background AI training and shadow-market evaluation that do not block the main trading loop.
 - Telegram notifications and command controls for status, AI state, positions, training, health, errors, execution decisions, lessons, and market regime.
-- SQLite storage for candles, orders, positions, stop-loss orders, AI audits, strategy lessons, market intelligence, and runtime errors.
+- SQLite storage for candles, orders, positions, stop-loss orders, AI audits, strategy lessons, experience tiers, market intelligence, and runtime errors.
 - Order safety layer for pending limit entries, filled-order reconciliation, incremental position updates, active stop-loss replacement, and OKX precision checks.
 - Standard-library runtime by default; optional WebSocket support can be installed separately.
 
@@ -29,7 +30,9 @@ The bot is conservative by default:
 - AI can suggest earlier exits or stop adjustments, but it cannot disable the hard stop-loss boundary.
 - Stop-loss updates replace active stop-loss records instead of stacking multiple active stops for the same position.
 - Prices and base quantities are rounded using OKX instrument metadata (`tickSz`, `lotSz`, `minSz`) before live submission.
-- Real order execution is limited to OKX spot. Margin, swaps, futures, options, grids, and short-side ideas are kept as shadow learning records unless explicitly implemented later.
+- Spot execution uses `tdMode=cash`. Margin and perpetual swap execution require `ALLOW_LEVERAGED_TRADING=true` or `ALLOW_DERIVATIVES_TRADING=true` plus `ENABLED_MARKET_TYPES`.
+- Perpetual swap orders set leverage before order placement and use `posSide` plus `reduceOnly` for closing routes. Contract quantities are rounded using swap instrument metadata.
+- AI can run in `rules_first` mode, where confirmed rule-based entries can trade while AI acts as a high-confidence risk veto and attribution engine.
 
 This repository is not investment advice. Review, test, and operate any automated trading system carefully.
 
@@ -151,6 +154,18 @@ RISK_PER_TRADE_USDT=200
 STOP_MODE=percent
 INITIAL_STOP_LOSS_PCT=0.20
 FIXED_STOP_LOSS_USDT=200
+ENABLED_MARKET_TYPES=SPOT
+ALLOW_LEVERAGED_TRADING=false
+ALLOW_DERIVATIVES_TRADING=false
+DERIVATIVES_DEMO_FIRST=true
+MARGIN_MODE=isolated
+POSITION_MODE=long_short
+MAX_LEVERAGE=1
+MOMENTUM_ENTRY_MODE=ai_required
+AI_RISK_VETO_ENABLED=true
+MOMENTUM_ROTATION_ENABLED=true
+MOMENTUM_ROTATION_MODE=conservative
+MOMENTUM_MAX_HOLD_MINUTES=0
 MOMENTUM_EXIT_GUARD_ENABLED=true
 MOMENTUM_TAKE_PROFIT_PCT=0.03
 MOMENTUM_STOP_LOSS_PCT=0.02
@@ -162,6 +177,22 @@ REPLACE_WEAK_POSITION_ENABLED=true
 AI_EXECUTION_DECISIONS_ENABLED=true
 ```
 
+Aggressive multi-market demo experimentation can be configured explicitly:
+
+```env
+ENABLED_MARKET_TYPES=SPOT,MARGIN,SWAP
+ALLOW_LEVERAGED_TRADING=true
+ALLOW_DERIVATIVES_TRADING=true
+DERIVATIVES_DEMO_FIRST=false
+MAX_LEVERAGE=5
+MAX_OPEN_POSITIONS=10
+SCAN_INTERVAL_SECONDS=30
+MOMENTUM_ENTRY_MODE=rules_first
+MOMENTUM_ROTATION_MODE=aggressive
+```
+
+Use demo keys first. Margin and swap routes can amplify losses and may require the OKX account to support the selected margin and position mode.
+
 Risk halt settings can be enabled for stricter operation:
 
 ```env
@@ -172,7 +203,7 @@ MAX_CONSECUTIVE_LOSSES=3
 
 For demo learning and research, `RISK_HALT_ENABLED=false` keeps the bot collecting experience after losses. For more conservative operation, enable it.
 
-With the defaults above, the momentum runner tries to keep scanning for new spot opportunities every 5 minutes. If there are fewer than 5 open positions and no duplicate pending entry order for a candidate, eligible symbols can continue entering while existing positions are managed independently.
+With the defaults above, the momentum runner tries to keep scanning for new opportunities every 5 minutes. If there are fewer than 5 open positions and no duplicate pending entry order for a candidate, eligible symbols can continue entering while existing positions are managed independently.
 
 The hard exit guard checks open positions before AI sell decisions:
 
@@ -192,7 +223,9 @@ AI review can provide structured JSON decisions for:
 - Size mode choices such as explore, reduced, normal, or strong.
 - Market-regime classification and trade attribution.
 
-AI decisions are advisory around the hard guard. They may tighten exits or suggest earlier sells, but the configured hard stop-loss and take-profit checks run first.
+AI decisions are advisory around the hard guard. They may tighten exits or suggest earlier sells, but the configured hard stop-loss and take-profit checks run first. In `rules_first` mode, AI is a risk veto and attribution layer rather than a required approval gate.
+
+Experience scoring stores experiment cost, return, PnL, and market direction into tiers: `elite`, `active`, `cooldown`, `rejected`, and `archived`. Live decision context should prefer `elite` and `active` experience while preserving raw trade and audit history for review.
 
 Training and audit records include prompt characters, response characters, prompt tokens, completion tokens, total tokens, attempted tokens, retry count, task count, success count, and error count when the provider returns those fields or when the bot can estimate attempts.
 
@@ -210,7 +243,7 @@ Run the test suite:
 python -m unittest discover -s tests -p "test*.py" -v
 ```
 
-The suite covers AI response parsing, MiMo-compatible request bodies, storage persistence, momentum scoring, order execution modes, limit orders, split orders, partial sells, stop-loss replacement, Telegram controls, OKX client behavior, and training-pool accounting.
+The suite covers AI response parsing, MiMo-compatible request bodies, storage persistence, momentum scoring, order execution modes, limit orders, split orders, partial sells, stop-loss replacement, Telegram controls, OKX spot/margin/swap client behavior, experience scoring, and training-pool accounting.
 
 ## Project Layout
 

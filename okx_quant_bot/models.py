@@ -59,6 +59,10 @@ class Position:
     base_qty: float = 0.0
     avg_entry_price: float = 0.0
     highest_price: float = 0.0
+    market_type: str = "SPOT"
+    direction: str = "long"
+    leverage: float = 1.0
+    margin_mode: str = "cash"
 
     @property
     def is_open(self) -> bool:
@@ -66,6 +70,16 @@ class Position:
 
     def market_value(self, price: float) -> float:
         return self.base_qty * price
+
+    def pnl(self, price: float) -> float:
+        multiplier = -1.0 if self.direction == "short" else 1.0
+        return (price - self.avg_entry_price) * self.base_qty * multiplier
+
+    def return_pct(self, price: float) -> float:
+        if self.avg_entry_price <= 0:
+            return 0.0
+        multiplier = -1.0 if self.direction == "short" else 1.0
+        return (price - self.avg_entry_price) / self.avg_entry_price * multiplier * 100.0
 
 
 @dataclass(frozen=True)
@@ -79,6 +93,28 @@ class OrderRequest:
     reason: str
     target_currency: str | None = None
     stop_loss_price: float | None = None
+    market_type: str = "SPOT"
+    td_mode: str = "cash"
+    pos_side: str | None = None
+    reduce_only: bool = False
+    leverage: float = 1.0
+    direction: str = "long"
+
+
+@dataclass(frozen=True)
+class TradeIntent:
+    market_type: str
+    symbol: str
+    side: Side
+    direction: str
+    size: float
+    order_type: str = "market"
+    price: float | None = None
+    leverage: float = 1.0
+    margin_mode: str = "cash"
+    reduce_only: bool = False
+    reason: str = ""
+    target_currency: str | None = None
 
 
 @dataclass(frozen=True)

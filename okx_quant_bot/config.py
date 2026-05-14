@@ -134,6 +134,22 @@ class Settings:
     partial_sell_fractions: tuple[float, ...] = (0.3, 0.5, 1.0)
     replace_weak_position_enabled: bool = True
     market_regime_enabled: bool = True
+    enabled_market_types: tuple[str, ...] = ("SPOT",)
+    allow_leveraged_trading: bool = False
+    allow_derivatives_trading: bool = False
+    derivatives_demo_first: bool = True
+    margin_mode: str = "isolated"
+    position_mode: str = "long_short"
+    max_leverage: float = 1.0
+    momentum_entry_mode: str = "ai_required"
+    ai_risk_veto_enabled: bool = True
+    momentum_rotation_enabled: bool = True
+    momentum_rotation_mode: str = "conservative"
+    momentum_max_hold_minutes: int = 0
+    rotation_score_edge: float = 5.0
+    experience_elite_threshold: float = 6.0
+    experience_reject_threshold: float = -4.0
+    experience_prune_days: int = 30
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -215,6 +231,22 @@ class Settings:
             partial_sell_fractions=_float_csv("PARTIAL_SELL_FRACTIONS", "0.3,0.5,1.0"),
             replace_weak_position_enabled=_bool(os.getenv("REPLACE_WEAK_POSITION_ENABLED"), True),
             market_regime_enabled=_bool(os.getenv("MARKET_REGIME_ENABLED"), True),
+            enabled_market_types=tuple(item.upper() for item in _csv("ENABLED_MARKET_TYPES", "SPOT")),
+            allow_leveraged_trading=_bool(os.getenv("ALLOW_LEVERAGED_TRADING"), False),
+            allow_derivatives_trading=_bool(os.getenv("ALLOW_DERIVATIVES_TRADING"), False),
+            derivatives_demo_first=_bool(os.getenv("DERIVATIVES_DEMO_FIRST"), True),
+            margin_mode=os.getenv("MARGIN_MODE", "isolated").strip().lower(),
+            position_mode=os.getenv("POSITION_MODE", "long_short").strip().lower(),
+            max_leverage=_float("MAX_LEVERAGE", 1.0),
+            momentum_entry_mode=os.getenv("MOMENTUM_ENTRY_MODE", "ai_required").strip().lower(),
+            ai_risk_veto_enabled=_bool(os.getenv("AI_RISK_VETO_ENABLED"), True),
+            momentum_rotation_enabled=_bool(os.getenv("MOMENTUM_ROTATION_ENABLED"), True),
+            momentum_rotation_mode=os.getenv("MOMENTUM_ROTATION_MODE", "conservative").strip().lower(),
+            momentum_max_hold_minutes=_int("MOMENTUM_MAX_HOLD_MINUTES", 0),
+            rotation_score_edge=_float("ROTATION_SCORE_EDGE", 5.0),
+            experience_elite_threshold=_float("EXPERIENCE_ELITE_THRESHOLD", 6.0),
+            experience_reject_threshold=_float("EXPERIENCE_REJECT_THRESHOLD", -4.0),
+            experience_prune_days=_int("EXPERIENCE_PRUNE_DAYS", 30),
         )
 
     def require_safe_trading_config(self) -> None:
@@ -222,6 +254,27 @@ class Settings:
             raise ValueError("Live trading is blocked unless ALLOW_LIVE_TRADING=true.")
         if self.trading_enabled and not (self.okx_api_key and self.okx_secret_key and self.okx_passphrase):
             raise ValueError("OKX credentials are required when TRADING_ENABLED=true.")
+        allowed_markets = {"SPOT", "MARGIN", "SWAP"}
+        if not self.enabled_market_types or any(market not in allowed_markets for market in self.enabled_market_types):
+            raise ValueError("ENABLED_MARKET_TYPES must contain only SPOT, MARGIN, and SWAP.")
+        if "MARGIN" in self.enabled_market_types and not self.allow_leveraged_trading:
+            raise ValueError("MARGIN trading requires ALLOW_LEVERAGED_TRADING=true.")
+        if "SWAP" in self.enabled_market_types and not self.allow_derivatives_trading:
+            raise ValueError("SWAP trading requires ALLOW_DERIVATIVES_TRADING=true.")
+        if self.trading_enabled and not self.okx_demo and self.derivatives_demo_first and "SWAP" in self.enabled_market_types:
+            raise ValueError("Live SWAP trading is blocked unless DERIVATIVES_DEMO_FIRST=false.")
+        if self.margin_mode not in {"cross", "isolated"}:
+            raise ValueError("MARGIN_MODE must be cross or isolated.")
+        if self.position_mode not in {"net", "long_short"}:
+            raise ValueError("POSITION_MODE must be net or long_short.")
+        if self.max_leverage <= 0:
+            raise ValueError("MAX_LEVERAGE must be positive.")
+        if self.momentum_entry_mode not in {"ai_required", "rules_first"}:
+            raise ValueError("MOMENTUM_ENTRY_MODE must be ai_required or rules_first.")
+        if self.momentum_rotation_mode not in {"conservative", "aggressive"}:
+            raise ValueError("MOMENTUM_ROTATION_MODE must be conservative or aggressive.")
+        if self.momentum_max_hold_minutes < 0:
+            raise ValueError("MOMENTUM_MAX_HOLD_MINUTES must be non-negative.")
         if not self.symbols:
             raise ValueError("At least one trading symbol must be configured.")
         if self.stop_mode not in {"percent", "fixed_loss"}:

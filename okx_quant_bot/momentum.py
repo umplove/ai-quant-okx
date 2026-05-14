@@ -69,23 +69,24 @@ class MarketScanner:
 
     def top_momentum_tickers(self) -> list[MarketTicker]:
         allowed_symbols = set(self.settings.symbols)
+        allow_short_trials = any(market in set(self.settings.enabled_market_types) for market in ("MARGIN", "SWAP"))
         tickers = [
             ticker
             for ticker in self.exchange.get_market_tickers("SPOT")
             if ticker.symbol in allowed_symbols
             and _is_tradeable_usdt_symbol(ticker.symbol)
-            and ticker.change_pct_24h > 0
+            and (ticker.change_pct_24h > 0 or allow_short_trials)
             and ticker.amplitude_pct_24h > 0
             and ticker.volume_quote_24h > 0
         ]
         by_gainers = sorted(
             tickers,
-            key=lambda t: (t.change_pct_24h, t.volume_quote_24h),
+            key=lambda t: (abs(t.change_pct_24h), t.volume_quote_24h),
             reverse=True,
         )[: self.settings.candidate_top_n]
         return sorted(
             by_gainers,
-            key=lambda t: (t.amplitude_pct_24h, t.change_pct_24h, t.volume_quote_24h),
+            key=lambda t: (t.amplitude_pct_24h, abs(t.change_pct_24h), t.volume_quote_24h),
             reverse=True,
         )
 
@@ -240,7 +241,7 @@ class CandidateScorer:
             news_score = sum(s.score for s in signals if s.source == "news")
             polymarket_score = sum(s.score for s in signals if s.source == "polymarket")
             market_score = (
-                ticker.change_pct_24h * 100.0
+                abs(ticker.change_pct_24h) * 100.0
                 + ticker.amplitude_pct_24h * 50.0
                 + math.log10(max(ticker.volume_quote_24h, 1.0))
             )

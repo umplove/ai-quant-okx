@@ -79,6 +79,12 @@ class Storage:
                 create table if not exists orders (
                     id integer primary key autoincrement,
                     symbol text not null,
+                    market_type text not null default 'SPOT',
+                    direction text not null default 'long',
+                    td_mode text not null default 'cash',
+                    pos_side text,
+                    reduce_only integer not null default 0,
+                    leverage real not null default 1,
                     side text not null,
                     size real not null,
                     order_type text not null,
@@ -101,6 +107,11 @@ class Storage:
                     base_qty real not null,
                     avg_entry_price real not null,
                     highest_price real not null,
+                    market_type text not null default 'SPOT',
+                    direction text not null default 'long',
+                    leverage real not null default 1,
+                    margin_mode text not null default 'cash',
+                    opened_at text default current_timestamp,
                     updated_at text default current_timestamp
                 );
 
@@ -173,6 +184,8 @@ class Storage:
                 create table if not exists strategy_lessons (
                     id integer primary key autoincrement,
                     symbol text not null,
+                    market_type text not null default 'SPOT',
+                    direction text not null default 'long',
                     pnl_usdt real not null,
                     return_pct real not null,
                     active integer not null,
@@ -282,14 +295,32 @@ class Storage:
                 create table if not exists trade_attributions (
                     id integer primary key autoincrement,
                     symbol text not null,
+                    market_type text not null default 'SPOT',
+                    direction text not null default 'long',
                     pnl_usdt real not null,
                     return_pct real not null,
+                    experiment_cost real not null default 0,
+                    experience_score real not null default 0,
+                    tier text not null default 'active',
                     category text not null,
                     confidence real not null,
                     reason text not null,
                     market_regime text not null,
                     raw text not null,
                     created_at text default current_timestamp
+                );
+
+                create table if not exists experience_scores (
+                    symbol text not null,
+                    market_type text not null,
+                    direction text not null,
+                    tier text not null,
+                    score real not null,
+                    win_count integer not null default 0,
+                    loss_count integer not null default 0,
+                    last_reason text not null default '',
+                    updated_at text default current_timestamp,
+                    primary key(symbol, market_type, direction)
                 );
 
                 create table if not exists market_regimes (
@@ -323,9 +354,28 @@ class Storage:
             self._ensure_column(conn, "ai_call_audits", "retry_count", "integer not null default 0")
             self._ensure_column(conn, "ai_training_runs", "attempted_tokens", "integer not null default 0")
             self._ensure_column(conn, "orders", "status", "text not null default 'unknown'")
+            self._ensure_column(conn, "orders", "market_type", "text not null default 'SPOT'")
+            self._ensure_column(conn, "orders", "direction", "text not null default 'long'")
+            self._ensure_column(conn, "orders", "td_mode", "text not null default 'cash'")
+            self._ensure_column(conn, "orders", "pos_side", "text")
+            self._ensure_column(conn, "orders", "reduce_only", "integer not null default 0")
+            self._ensure_column(conn, "orders", "leverage", "real not null default 1")
             self._ensure_column(conn, "orders", "filled_size", "real not null default 0")
             self._ensure_column(conn, "orders", "avg_fill_price", "real")
             self._ensure_column(conn, "orders", "updated_at", "text")
+            self._ensure_column(conn, "positions", "market_type", "text not null default 'SPOT'")
+            self._ensure_column(conn, "positions", "direction", "text not null default 'long'")
+            self._ensure_column(conn, "positions", "leverage", "real not null default 1")
+            self._ensure_column(conn, "positions", "margin_mode", "text not null default 'cash'")
+            self._ensure_column(conn, "positions", "opened_at", "text")
+            conn.execute("update positions set opened_at = coalesce(opened_at, updated_at, current_timestamp)")
+            self._ensure_column(conn, "strategy_lessons", "market_type", "text not null default 'SPOT'")
+            self._ensure_column(conn, "strategy_lessons", "direction", "text not null default 'long'")
+            self._ensure_column(conn, "trade_attributions", "market_type", "text not null default 'SPOT'")
+            self._ensure_column(conn, "trade_attributions", "direction", "text not null default 'long'")
+            self._ensure_column(conn, "trade_attributions", "experiment_cost", "real not null default 0")
+            self._ensure_column(conn, "trade_attributions", "experience_score", "real not null default 0")
+            self._ensure_column(conn, "trade_attributions", "tier", "text not null default 'active'")
             self._ensure_column(conn, "stop_loss_orders", "active", "integer not null default 1")
             self._ensure_column(conn, "stop_loss_orders", "updated_at", "text")
             conn.execute("update orders set updated_at = coalesce(updated_at, created_at, current_timestamp)")
@@ -390,12 +440,19 @@ class Storage:
             conn.execute(
                 """
                 insert or replace into orders(
-                    symbol, side, size, order_type, price, client_order_id, exchange_order_id,
+                    symbol, market_type, direction, td_mode, pos_side, reduce_only, leverage,
+                    side, size, order_type, price, client_order_id, exchange_order_id,
                     ok, reason, error, raw, status, filled_size, avg_fill_price, updated_at
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
                 """,
                 (
                     request.symbol,
+                    request.market_type,
+                    request.direction,
+                    request.td_mode,
+                    request.pos_side,
+                    int(request.reduce_only),
+                    float(request.leverage),
                     request.side.value,
                     request.size,
                     request.order_type,
@@ -608,7 +665,7 @@ class Storage:
             row = conn.execute("select * from positions where symbol = ?", (symbol,)).fetchone()
         if row is None:
             return Position(symbol=symbol)
-        return Position(row["symbol"], row["base_qty"], row["avg_entry_price"], row["highest_price"])
+        return _position_from_row(row)
 
     def open_position_count(self) -> int:
         with self.session() as conn:
@@ -630,7 +687,7 @@ class Storage:
                 """
             ).fetchall()
         return [
-            Position(row["symbol"], row["base_qty"], row["avg_entry_price"], row["highest_price"])
+            _position_from_row(row)
             for row in rows
         ]
 
@@ -638,12 +695,20 @@ class Storage:
         with self.session() as conn:
             conn.execute(
                 """
-                insert into positions(symbol, base_qty, avg_entry_price, highest_price)
-                values (?, ?, ?, ?)
+                insert into positions(symbol, base_qty, avg_entry_price, highest_price, market_type, direction, leverage, margin_mode, opened_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, current_timestamp)
                 on conflict(symbol) do update set
                     base_qty = excluded.base_qty,
                     avg_entry_price = excluded.avg_entry_price,
                     highest_price = excluded.highest_price,
+                    market_type = excluded.market_type,
+                    direction = excluded.direction,
+                    leverage = excluded.leverage,
+                    margin_mode = excluded.margin_mode,
+                    opened_at = case
+                        when positions.base_qty <= 0 or positions.avg_entry_price <= 0 then excluded.opened_at
+                        else coalesce(positions.opened_at, excluded.opened_at)
+                    end,
                     updated_at = current_timestamp
                 """,
                 (
@@ -651,6 +716,10 @@ class Storage:
                     position.base_qty,
                     position.avg_entry_price,
                     position.highest_price,
+                    position.market_type,
+                    position.direction,
+                    position.leverage,
+                    position.margin_mode,
                 ),
             )
 
@@ -669,6 +738,18 @@ class Storage:
             row = conn.execute("select value from bot_state where key = ?", (key,)).fetchone()
         return default if row is None else str(row["value"])
 
+    def position_age_minutes(self, symbol: str) -> float:
+        with self.session() as conn:
+            row = conn.execute(
+                """
+                select (julianday('now') - julianday(opened_at)) * 24 * 60 as age
+                from positions
+                where symbol = ?
+                """,
+                (symbol,),
+            ).fetchone()
+        return 0.0 if row is None or row["age"] is None else float(row["age"])
+
     def save_strategy_lesson(
         self,
         symbol: str,
@@ -676,15 +757,17 @@ class Storage:
         return_pct: float,
         summary: str,
         raw: str = "",
+        market_type: str = "SPOT",
+        direction: str = "long",
     ) -> None:
         active = int(pnl_usdt > 0)
         with self.session() as conn:
             conn.execute(
                 """
-                insert into strategy_lessons(symbol, pnl_usdt, return_pct, active, summary, raw)
-                values (?, ?, ?, ?, ?, ?)
+                insert into strategy_lessons(symbol, market_type, direction, pnl_usdt, return_pct, active, summary, raw)
+                values (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (symbol, pnl_usdt, return_pct, active, summary[:1000], raw[:4000]),
+                (symbol, market_type, direction, pnl_usdt, return_pct, active, summary[:1000], raw[:4000]),
             )
 
     def active_strategy_lessons(self, limit: int = 8) -> list[str]:
@@ -1065,18 +1148,31 @@ class Storage:
         reason: str,
         market_regime: str = "",
         raw: str = "",
+        market_type: str = "SPOT",
+        direction: str = "long",
+        experiment_cost: float = 0.0,
+        experience_score: float | None = None,
+        tier: str | None = None,
     ) -> None:
+        score = _experience_score(pnl_usdt, return_pct, experiment_cost) if experience_score is None else experience_score
+        tier_value = tier or _experience_tier(score)
         with self.session() as conn:
             conn.execute(
                 """
                 insert into trade_attributions(
-                    symbol, pnl_usdt, return_pct, category, confidence, reason, market_regime, raw
-                ) values (?, ?, ?, ?, ?, ?, ?, ?)
+                    symbol, market_type, direction, pnl_usdt, return_pct, experiment_cost,
+                    experience_score, tier, category, confidence, reason, market_regime, raw
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol,
+                    market_type,
+                    direction,
                     float(pnl_usdt),
                     float(return_pct),
+                    float(experiment_cost),
+                    float(score),
+                    tier_value,
                     category,
                     float(confidence),
                     reason[:1000],
@@ -1084,12 +1180,14 @@ class Storage:
                     raw[:4000],
                 ),
             )
+            self._upsert_experience_score(conn, symbol, market_type, direction, float(score), tier_value, reason)
 
     def recent_trade_attributions(self, limit: int = 10) -> list[str]:
         with self.session() as conn:
             rows = conn.execute(
                 """
-                select symbol, pnl_usdt, return_pct, category, confidence, reason, market_regime
+                select symbol, market_type, direction, pnl_usdt, return_pct, category, confidence,
+                       reason, market_regime, experiment_cost, experience_score, tier
                 from trade_attributions
                 order by created_at desc, id desc
                 limit ?
@@ -1097,10 +1195,77 @@ class Storage:
                 (limit,),
             ).fetchall()
         return [
-            f"{r['symbol']} {r['category']} pnl={r['pnl_usdt']:+.2f} return={r['return_pct']:+.2f}% "
-            f"regime={r['market_regime'] or '未知'} conf={r['confidence']:.2f}: {r['reason']}"
+            f"{r['symbol']} {r['market_type']}/{r['direction']} {r['tier']} {r['category']} "
+            f"pnl={r['pnl_usdt']:+.2f} return={r['return_pct']:+.2f}% cost={r['experiment_cost']:.2f} "
+            f"score={r['experience_score']:+.2f} regime={r['market_regime'] or '未知'} "
+            f"conf={r['confidence']:.2f}: {r['reason']}"
             for r in rows
         ]
+
+    def _upsert_experience_score(
+        self,
+        conn: sqlite3.Connection,
+        symbol: str,
+        market_type: str,
+        direction: str,
+        score_delta: float,
+        tier: str,
+        reason: str,
+    ) -> None:
+        row = conn.execute(
+            """
+            select score, win_count, loss_count
+            from experience_scores
+            where symbol = ? and market_type = ? and direction = ?
+            """,
+            (symbol, market_type, direction),
+        ).fetchone()
+        current = float(row["score"]) if row else 0.0
+        new_score = current * 0.85 + score_delta
+        wins = int(row["win_count"] if row else 0) + (1 if score_delta > 0 else 0)
+        losses = int(row["loss_count"] if row else 0) + (1 if score_delta < 0 else 0)
+        conn.execute(
+            """
+            insert into experience_scores(symbol, market_type, direction, tier, score, win_count, loss_count, last_reason)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(symbol, market_type, direction) do update set
+                tier = excluded.tier,
+                score = excluded.score,
+                win_count = excluded.win_count,
+                loss_count = excluded.loss_count,
+                last_reason = excluded.last_reason,
+                updated_at = current_timestamp
+            """,
+            (symbol, market_type, direction, _experience_tier(new_score) or tier, new_score, wins, losses, reason[:1000]),
+        )
+
+    def experience_summary(self) -> str:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select tier, count(*) as count
+                from experience_scores
+                group by tier
+                """
+            ).fetchall()
+            recent = conn.execute(
+                """
+                select symbol, market_type, direction, tier, score, last_reason
+                from experience_scores
+                order by updated_at desc
+                limit 8
+                """
+            ).fetchall()
+        counts = {str(row["tier"]): int(row["count"]) for row in rows}
+        lines = [
+            "经验分层: "
+            + ", ".join(f"{tier}={counts.get(tier, 0)}" for tier in ("elite", "active", "cooldown", "rejected", "archived"))
+        ]
+        lines.extend(
+            f"{r['symbol']} {r['market_type']}/{r['direction']} {r['tier']} score={r['score']:+.2f}: {r['last_reason']}"
+            for r in recent
+        )
+        return "\n".join(lines)
 
     def save_market_regime(self, regime: str, confidence: float, reason: str, raw: str = "") -> None:
         with self.session() as conn:
@@ -1221,6 +1386,33 @@ def _state_from_raw(raw: dict) -> str:
         "rejected": "rejected",
     }
     return mapping.get(state, "")
+
+
+def _position_from_row(row: sqlite3.Row) -> Position:
+    return Position(
+        symbol=row["symbol"],
+        base_qty=float(row["base_qty"]),
+        avg_entry_price=float(row["avg_entry_price"]),
+        highest_price=float(row["highest_price"]),
+        market_type=str(row["market_type"] or "SPOT"),
+        direction=str(row["direction"] or "long"),
+        leverage=float(row["leverage"] or 1.0),
+        margin_mode=str(row["margin_mode"] or "cash"),
+    )
+
+
+def _experience_score(pnl_usdt: float, return_pct: float, experiment_cost: float) -> float:
+    return float(return_pct) + max(-5.0, min(float(pnl_usdt) / 20.0, 5.0)) - float(experiment_cost)
+
+
+def _experience_tier(score: float) -> str:
+    if score >= 6.0:
+        return "elite"
+    if score >= 0.0:
+        return "active"
+    if score > -4.0:
+        return "cooldown"
+    return "rejected"
 
 
 def _filled_size_from_raw(raw: dict) -> float:

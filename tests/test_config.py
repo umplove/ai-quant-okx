@@ -30,6 +30,33 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.openai_api_key, "mimo-secret")
         self.assertEqual(settings.ai_config_warning(), "")
 
+    def test_margin_and_swap_require_explicit_switches(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            Path(tmp, ".env").write_text(
+                "\n".join(
+                    [
+                        "ENABLED_MARKET_TYPES=SPOT,MARGIN,SWAP",
+                        "ALLOW_LEVERAGED_TRADING=true",
+                        "ALLOW_DERIVATIVES_TRADING=true",
+                        "DERIVATIVES_DEMO_FIRST=false",
+                        "MAX_LEVERAGE=5",
+                        "MOMENTUM_ENTRY_MODE=rules_first",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            old_cwd = Path.cwd()
+            os.chdir(tmp)
+            try:
+                settings = Settings.from_env()
+            finally:
+                os.chdir(old_cwd)
+
+        settings.require_safe_trading_config()
+        self.assertEqual(settings.enabled_market_types, ("SPOT", "MARGIN", "SWAP"))
+        self.assertEqual(settings.max_leverage, 5)
+        self.assertEqual(settings.momentum_entry_mode, "rules_first")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -84,6 +84,52 @@ class _TradingExchange:
         request = OrderRequest(symbol, Side.SELL, base_size, "market", None, f"SELL{symbol}{len(self.sell_calls)}", reason)
         return request, OrderResult(True, symbol, Side.SELL, "ord", request.client_order_id, {"avgPx": "2"})
 
+    def place_margin_market(self, symbol, side, base_size, direction, leverage, margin_mode, reason, reduce_only=False):
+        if reduce_only:
+            self.sell_calls.append(symbol)
+        else:
+            self.buy_calls.append(symbol)
+        request = OrderRequest(
+            symbol,
+            side,
+            base_size,
+            "market",
+            None,
+            f"MG{symbol}{len(self.buy_calls) + len(self.sell_calls)}",
+            reason,
+            market_type="MARGIN",
+            td_mode=margin_mode,
+            reduce_only=reduce_only,
+            leverage=leverage,
+            direction=direction,
+        )
+        return request, OrderResult(True, symbol, side, "ord", request.client_order_id, {"avgPx": "2", "accFillSz": str(base_size)})
+
+    def place_swap_market(self, symbol, side, contract_size, direction, leverage, margin_mode, reason, reduce_only=False):
+        if reduce_only:
+            self.sell_calls.append(symbol)
+        else:
+            self.buy_calls.append(symbol)
+        request = OrderRequest(
+            symbol,
+            side,
+            contract_size,
+            "market",
+            None,
+            f"SW{symbol}{len(self.buy_calls) + len(self.sell_calls)}",
+            reason,
+            market_type="SWAP",
+            td_mode=margin_mode,
+            pos_side=direction,
+            reduce_only=reduce_only,
+            leverage=leverage,
+            direction=direction,
+        )
+        return request, OrderResult(True, symbol, side, "ord", request.client_order_id, {"avgPx": "2", "accFillSz": str(contract_size)})
+
+    def swap_contract_size_for_quote(self, symbol, quote_amount, price):
+        return quote_amount / price if price > 0 else 0
+
     def place_stop_loss_order(self, symbol, size, stop_price):
         return StopLossOrder(symbol, "algo", f"SL{symbol}{len(self.buy_calls)}", stop_price, size, True, {})
 
@@ -572,6 +618,85 @@ class MomentumRunnerTests(unittest.TestCase):
             self.assertIn("AI执行决策", runner._execution_message())
             self.assertIn("交易归因", runner._lessons_message())
             self.assertIn("AI行情状态", runner._market_message())
+
+
+    def test_rules_first_buy_does_not_require_ai_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            settings = _trading_settings(db, ("AAA-USDT",), max_open_positions=1)
+            settings = settings.__class__(**{**settings.__dict__, "momentum_entry_mode": "rules_first"})
+            exchange = _TradingExchange([MarketTicker("AAA-USDT", 2, 1, 2, 1, 1000, 1)])
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+
+            decision = runner._entry_decision(_candidate("AAA-USDT"), {"action": "hold", "confidence": 0.5, "reason": "too early"})
+            runner._execute_buy_decision(_candidate("AAA-USDT"), decision, MomentumScan(exchange.tickers, [], []))
+
+            self.assertEqual(exchange.buy_calls, ["AAA-USDT"])
+            self.assertTrue(storage.get_position("AAA-USDT").is_open)
+
+    def test_ai_high_confidence_hold_vetoes_rules_first_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            settings = _trading_settings(db, ("AAA-USDT",), max_open_positions=1)
+            settings = settings.__class__(**{**settings.__dict__, "momentum_entry_mode": "rules_first"})
+            runner = MomentumBotRunner(settings, storage, _TradingExchange([]), _Notifier())
+
+            decision = runner._entry_decision(_candidate("AAA-USDT"), {"action": "hold", "confidence": 0.95, "reason": "risk"})
+
+            self.assertIsNone(decision)
+            self.assertIn("ai_veto_buy", storage.recent_strategy_lessons()[0])
+
+    def test_swap_short_entry_and_reduce_only_exit_use_derivative_route(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            settings = _trading_settings(db, ("AAA-USDT",), max_open_positions=2)
+            settings = settings.__class__(
+                **{
+                    **settings.__dict__,
+                    "enabled_market_types": ("SWAP",),
+                    "allow_derivatives_trading": True,
+                    "max_leverage": 5,
+                    "margin_mode": "isolated",
+                }
+            )
+            exchange = _TradingExchange([MarketTicker("AAA-USDT", 1.8, 2, 2.1, 1.7, 1000, 1)])
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+            candidate = _candidate("AAA-USDT")
+            candidate = candidate.__class__(**{**candidate.__dict__, "price": 1.8, "change_pct_24h": -0.1})
+
+            runner._open_candidate_position(candidate, 100, "test")
+            position = storage.get_position("AAA-USDT-SWAP")
+            runner._sell_position(position, 1.7, "test")
+
+            self.assertEqual(position.market_type, "SWAP")
+            self.assertEqual(position.direction, "short")
+            self.assertEqual(position.leverage, 5)
+            self.assertFalse(storage.get_position("AAA-USDT-SWAP").is_open)
+
+    def test_max_hold_time_triggers_time_rotation_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            storage.save_position(Position("AAA-USDT", 10, 100, 100))
+            with storage.session() as conn:
+                conn.execute("update positions set opened_at = datetime('now', '-10 minutes') where symbol = 'AAA-USDT'")
+            settings = _trading_settings(db, ("AAA-USDT",))
+            settings = settings.__class__(**{**settings.__dict__, "momentum_max_hold_minutes": 5})
+            exchange = _TradingExchange([MarketTicker("AAA-USDT", 100.5, 100, 101, 99, 1000, 1)])
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+            scan = MomentumScan(tickers=exchange.tickers, info_signals=[], candidates=[])
+
+            runner._sell_positions_with_hard_exit(scan)
+
+            self.assertEqual(exchange.sell_calls, ["AAA-USDT"])
+            self.assertFalse(storage.get_position("AAA-USDT").is_open)
 
 
 def _trading_settings(db: Path, symbols: tuple[str, ...], max_open_positions: int = 2):

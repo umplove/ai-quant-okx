@@ -10,7 +10,7 @@ from okx_quant_bot.ai_reviewer import AiReviewClient
 from okx_quant_bot.config import Settings
 from okx_quant_bot.data import Storage
 from okx_quant_bot.exchange import OkxRestClient
-from okx_quant_bot.models import CandidateScore, OrderResult, Position, Side, StopLossOrder
+from okx_quant_bot.models import CandidateScore, OrderResult, Position, Side, StopLossOrder, TradeIntent
 from okx_quant_bot.momentum import MomentumScan, run_momentum_scan, stop_loss_plan, target_position_usdt, utc_day
 from okx_quant_bot.notify import Notifier
 from okx_quant_bot.trade_review import TradeReviewEngine
@@ -26,6 +26,7 @@ class MomentumBotRunner:
     training_pool: AiTrainingPool | None = None
     _ai_executor: ThreadPoolExecutor | None = field(default=None, init=False, repr=False)
     _pending_ai: dict[str, Future] = field(default_factory=dict, init=False, repr=False)
+    _exited_symbols: set[str] = field(default_factory=set, init=False, repr=False)
 
     def run_forever(self) -> None:
         self.settings.require_safe_trading_config()
@@ -49,6 +50,7 @@ class MomentumBotRunner:
             time.sleep(self.settings.scan_interval_seconds)
 
     def run_once(self) -> MomentumScan:
+        self._exited_symbols = set()
         self.settings.require_safe_trading_config()
         self.storage.init()
         scan = self._apply_experience_bias(run_momentum_scan(self.settings, self.exchange))
@@ -73,6 +75,7 @@ class MomentumBotRunner:
             self._submit_buy_review(scan, candidate, market_regime)
             self._collect_finished_ai_tasks(grace_seconds=0.05)
             decision = self.storage.latest_execution_decision(candidate.symbol, "buy", self._ai_decision_ttl_seconds())
+            decision = self._entry_decision(candidate, decision)
             if decision and self._is_tradable_or_replaceable(candidate, decision):
                 self._execute_buy_decision(candidate, decision, scan)
 
@@ -145,6 +148,8 @@ class MomentumBotRunner:
     def _is_tradable_candidate(self, candidate: CandidateScore) -> bool:
         if candidate.symbol not in set(self.settings.symbols):
             return False
+        if candidate.symbol in self._exited_symbols:
+            return False
         if not candidate.confirmed:
             return False
         if self.storage.pending_entry_orders(candidate.symbol):
@@ -155,6 +160,30 @@ class MomentumBotRunner:
             return False
         return True
 
+    def _entry_decision(self, candidate: CandidateScore, decision: dict | None) -> dict | None:
+        if self.settings.momentum_entry_mode != "rules_first":
+            return decision
+        if decision and self._ai_vetoes_entry(decision):
+            self.storage.save_strategy_lesson(candidate.symbol, 0.0, 0.0, f"ai_veto_buy:{decision.get('reason') or ''}", "")
+            return None
+        if decision and str(decision.get("action") or "") == "buy":
+            return decision
+        return {
+            "action": "buy",
+            "entry_mode": "market_now",
+            "exit_mode": "hold",
+            "size_mode": "normal",
+            "stop_mode": "fixed",
+            "replace_mode": "replace_weakest" if self.settings.momentum_rotation_mode == "aggressive" else "none",
+            "confidence": 0.66,
+            "reason": f"rules_first_buy:{candidate.reason}",
+        }
+
+    def _ai_vetoes_entry(self, decision: dict) -> bool:
+        if not self.settings.ai_risk_veto_enabled:
+            return False
+        return str(decision.get("action") or "") == "hold" and float(decision.get("confidence") or 0.0) >= 0.85
+
     def _is_tradable_or_replaceable(self, candidate: CandidateScore, decision: dict) -> bool:
         if not self._execution_buy_allowed(decision):
             return False
@@ -162,6 +191,7 @@ class MomentumBotRunner:
             return True
         return (
             self.settings.replace_weak_position_enabled
+            and self.settings.momentum_rotation_enabled
             and self.storage.open_position_count() >= self.settings.max_open_positions
             and str(decision.get("replace_mode")) == "replace_weakest"
             and not self.storage.get_position(candidate.symbol).is_open
@@ -336,7 +366,7 @@ class MomentumBotRunner:
         if entry_mode == "split_limit" and self.settings.limit_order_enabled:
             self._place_split_limit_buys(candidate, quote_amount, reason)
             return
-        self._buy_and_protect(candidate, quote_amount, reason)
+        self._open_candidate_position(candidate, quote_amount, reason)
 
     def _execution_buy_allowed(self, decision: dict) -> bool:
         return (
@@ -348,6 +378,77 @@ class MomentumBotRunner:
     def _target_quote_amount(self, size_mode: str) -> float:
         multipliers = {"explore": 0.3, "reduced": 0.5, "normal": 1.0, "strong": 1.5}
         return target_position_usdt(self.settings) * multipliers.get(size_mode, 1.0)
+
+    def _open_candidate_position(self, candidate: CandidateScore, quote_amount: float, reason: str) -> None:
+        market_type, direction = self._entry_market(candidate)
+        if market_type == "SPOT":
+            self._buy_and_protect(candidate, quote_amount, reason)
+            return
+        trade_symbol = self._trade_symbol(candidate.symbol, market_type)
+        leverage = self.settings.max_leverage
+        margin_mode = self.settings.margin_mode
+        side = Side.SELL if direction == "short" else Side.BUY
+        if not self.settings.trading_enabled:
+            request, result = self._dry_run_buy(candidate, quote_amount, "market")
+            request = request.__class__(
+                **{
+                    **request.__dict__,
+                    "symbol": trade_symbol,
+                    "side": side,
+                    "market_type": market_type,
+                    "direction": direction,
+                    "td_mode": margin_mode,
+                    "pos_side": direction if market_type == "SWAP" else None,
+                    "leverage": leverage,
+                }
+            )
+        elif market_type == "MARGIN":
+            base_size = quote_amount / candidate.price if candidate.price > 0 else 0.0
+            request, result = self.exchange.place_margin_market(
+                trade_symbol,
+                side,
+                base_size,
+                direction,
+                leverage,
+                margin_mode,
+                f"rules_margin:{reason}",
+            )
+        else:
+            contract_size = self.exchange.swap_contract_size_for_quote(trade_symbol, quote_amount, candidate.price)
+            request, result = self.exchange.place_swap_market(
+                trade_symbol,
+                side,
+                contract_size,
+                direction,
+                leverage,
+                margin_mode,
+                f"rules_swap:{reason}",
+            )
+        self.storage.save_order(request, result)
+        if not result.ok:
+            self._record_execution_failure(trade_symbol, "entry_failed", result.error or "unknown", result.raw)
+            return
+        fill_price = _filled_price(result) or candidate.price
+        fill_size = _filled_size(result) or (
+            self.exchange.swap_contract_size_for_quote(trade_symbol, quote_amount, fill_price)
+            if market_type == "SWAP" and self.settings.trading_enabled
+            else quote_amount / fill_price if fill_price > 0 else 0.0
+        )
+        self.storage.save_position(Position(trade_symbol, fill_size, fill_price, fill_price, market_type, direction, leverage, margin_mode))
+
+    def _entry_market(self, candidate: CandidateScore) -> tuple[str, str]:
+        markets = set(self.settings.enabled_market_types)
+        direction = "short" if candidate.change_pct_24h < 0 and markets.intersection({"MARGIN", "SWAP"}) else "long"
+        if "SWAP" in markets and self.settings.allow_derivatives_trading:
+            return "SWAP", direction
+        if "MARGIN" in markets and self.settings.allow_leveraged_trading:
+            return "MARGIN", direction
+        return "SPOT", "long"
+
+    def _trade_symbol(self, symbol: str, market_type: str) -> str:
+        if market_type == "SWAP" and not symbol.endswith("-SWAP"):
+            return f"{symbol}-SWAP"
+        return symbol
 
     def _buy_and_protect(self, candidate: CandidateScore, quote_amount: float | None = None, reason: str | None = None) -> None:
         quote_amount = quote_amount if quote_amount is not None else target_position_usdt(self.settings)
@@ -416,22 +517,38 @@ class MomentumBotRunner:
             return
         prices = {ticker.symbol: ticker.last for ticker in scan.tickers}
         for position in self.storage.open_positions():
-            price = prices.get(position.symbol)
+            price = prices.get(position.symbol) or prices.get(_spot_symbol(position.symbol))
             if price is None or price <= 0 or position.avg_entry_price <= 0:
                 continue
+            if self.settings.momentum_max_hold_minutes > 0:
+                age = self.storage.position_age_minutes(position.symbol)
+                if age >= self.settings.momentum_max_hold_minutes:
+                    self._sell_position(position, price, "time_rotation_exit", fraction=1.0)
+                    continue
             prior_highest = max(position.highest_price, position.avg_entry_price)
             if price > prior_highest:
                 position = Position(position.symbol, position.base_qty, position.avg_entry_price, price)
                 self.storage.save_position(position)
                 prior_highest = price
-            take_profit_price = position.avg_entry_price * (1.0 + self.settings.momentum_take_profit_pct)
-            stop_loss_price = position.avg_entry_price * (1.0 - self.settings.momentum_stop_loss_pct)
-            trailing_price = prior_highest * (1.0 - self.settings.momentum_trailing_stop_pct)
-            if price >= take_profit_price:
+            if position.direction == "short":
+                take_profit_price = position.avg_entry_price * (1.0 - self.settings.momentum_take_profit_pct)
+                stop_loss_price = position.avg_entry_price * (1.0 + self.settings.momentum_stop_loss_pct)
+                trailing_price = prior_highest * (1.0 + self.settings.momentum_trailing_stop_pct)
+                take_profit_hit = price <= take_profit_price
+                stop_loss_hit = price >= stop_loss_price
+                trailing_hit = prior_highest < position.avg_entry_price and price >= trailing_price
+            else:
+                take_profit_price = position.avg_entry_price * (1.0 + self.settings.momentum_take_profit_pct)
+                stop_loss_price = position.avg_entry_price * (1.0 - self.settings.momentum_stop_loss_pct)
+                trailing_price = prior_highest * (1.0 - self.settings.momentum_trailing_stop_pct)
+                take_profit_hit = price >= take_profit_price
+                stop_loss_hit = price <= stop_loss_price
+                trailing_hit = prior_highest > position.avg_entry_price and price <= trailing_price
+            if take_profit_hit:
                 self._sell_position(position, price, "hard_take_profit", fraction=1.0)
-            elif price <= stop_loss_price:
+            elif stop_loss_hit:
                 self._sell_position(position, price, "hard_stop_loss", fraction=1.0)
-            elif prior_highest > position.avg_entry_price and price <= trailing_price:
+            elif trailing_hit:
                 self._sell_position(position, price, "hard_trailing_stop", fraction=1.0)
 
     def _sell_position(self, position: Position, current_price: float, reason: str, fraction: float = 1.0) -> None:
@@ -441,33 +558,68 @@ class MomentumBotRunner:
         stop_price = self._current_stop_price(position)
         if not self.settings.trading_enabled:
             request, result = self._dry_run_sell(position, reason, sell_qty)
+        elif position.market_type == "MARGIN":
+            request, result = self.exchange.place_margin_market(
+                position.symbol,
+                Side.BUY if position.direction == "short" else Side.SELL,
+                sell_qty,
+                position.direction,
+                position.leverage,
+                position.margin_mode,
+                f"close_margin:{reason}",
+                reduce_only=True,
+            )
+        elif position.market_type == "SWAP":
+            request, result = self.exchange.place_swap_market(
+                position.symbol,
+                Side.BUY if position.direction == "short" else Side.SELL,
+                sell_qty,
+                position.direction,
+                position.leverage,
+                position.margin_mode,
+                f"close_swap:{reason}",
+                reduce_only=True,
+            )
         else:
             request, result = self.exchange.place_market_sell_base(position.symbol, sell_qty, f"ai_sell:{reason}")
         self.storage.save_order(request, result)
         if not result.ok:
             self._record_execution_failure(position.symbol, "卖出失败", result.error or "unknown", result.raw)
             return
-        pnl = (current_price - position.avg_entry_price) * sell_qty
+        multiplier = -1.0 if position.direction == "short" else 1.0
+        pnl = (current_price - position.avg_entry_price) * sell_qty * multiplier
         return_pct = 0.0 if position.avg_entry_price <= 0 else (
-            (current_price - position.avg_entry_price) / position.avg_entry_price * 100.0
+            (current_price - position.avg_entry_price) / position.avg_entry_price * multiplier * 100.0
         )
         remaining = position.base_qty - sell_qty
         if remaining > 1e-12:
-            updated = Position(position.symbol, remaining, position.avg_entry_price, max(position.highest_price, current_price))
+            updated = Position(
+                position.symbol,
+                remaining,
+                position.avg_entry_price,
+                max(position.highest_price, current_price),
+                position.market_type,
+                position.direction,
+                position.leverage,
+                position.margin_mode,
+            )
             self.storage.save_position(updated)
-            self._replace_stop_loss(updated, stop_price)
+            if position.market_type == "SPOT":
+                self._replace_stop_loss(updated, stop_price)
         else:
             self.storage.save_position(Position(symbol=position.symbol))
             self._cancel_active_stop_losses(position.symbol)
-        self.storage.save_strategy_lesson(position.symbol, pnl, return_pct, f"ai_sell:{reason}", str(result.raw))
+            self._exited_symbols.add(_spot_symbol(position.symbol))
+        self.storage.save_strategy_lesson(position.symbol, pnl, return_pct, f"ai_sell:{reason}", str(result.raw), position.market_type, position.direction)
         self._record_trade_attribution(position.symbol, pnl, return_pct, f"卖出完成: {reason}")
 
     def _replace_weakest_position(self, scan: MomentumScan, reason: str) -> bool:
         prices = {ticker.symbol: ticker.last for ticker in scan.tickers}
         weakest: tuple[float, Position, float] | None = None
         for position in self.storage.open_positions():
-            price = prices.get(position.symbol, position.avg_entry_price)
-            return_pct = 0.0 if position.avg_entry_price <= 0 else (price - position.avg_entry_price) / position.avg_entry_price * 100.0
+            price = prices.get(position.symbol) or prices.get(_spot_symbol(position.symbol), position.avg_entry_price)
+            multiplier = -1.0 if position.direction == "short" else 1.0
+            return_pct = 0.0 if position.avg_entry_price <= 0 else (price - position.avg_entry_price) / position.avg_entry_price * multiplier * 100.0
             if weakest is None or return_pct < weakest[0]:
                 weakest = (return_pct, position, price)
         if weakest is None:
@@ -586,7 +738,10 @@ class MomentumBotRunner:
         self.storage.save_strategy_lesson(symbol, 0.0, 0.0, f"execution_failed:{summary}:{error}", str(raw))
         self.storage.save_trade_attribution(symbol, 0.0, 0.0, "执行失败", 1.0, f"{summary}: {error}", self._current_market_regime(), str(raw))
 
-    def _record_trade_attribution(self, symbol: str, pnl: float, return_pct: float, summary: str) -> None:
+    def _record_trade_attribution(self, symbol: str, pnl: float, return_pct: float, summary: str, position: Position | None = None) -> None:
+        market_type = position.market_type if position is not None else "SPOT"
+        direction = position.direction if position is not None else "long"
+        experiment_cost = abs(pnl) * 0.02 + abs(return_pct) * 0.05
         if not self.settings.ai_review_enabled:
             self.storage.save_trade_attribution(symbol, pnl, return_pct, "未知", 0.0, summary, self._current_market_regime(), "")
             return
@@ -608,6 +763,9 @@ class MomentumBotRunner:
                 reason,
                 self._current_market_regime(),
                 raw_text,
+                market_type,
+                direction,
+                experiment_cost,
             )
         else:
             error = getattr(attribution, "error", "") or summary
@@ -657,12 +815,18 @@ class MomentumBotRunner:
         sell_size = position.base_qty if size is None else size
         request = OrderRequest(
             symbol=position.symbol,
-            side=Side.SELL,
+            side=Side.BUY if position.direction == "short" else Side.SELL,
             size=sell_size,
             order_type="market",
             price=None,
             client_order_id=OkxRestClient.client_order_id("DRYS", position.symbol),
             reason=f"ai_sell:{reason}",
+            market_type=position.market_type,
+            td_mode=position.margin_mode,
+            pos_side=position.direction if position.market_type == "SWAP" else None,
+            reduce_only=position.market_type in {"MARGIN", "SWAP"},
+            leverage=position.leverage,
+            direction=position.direction,
         )
         result = OrderResult(True, position.symbol, Side.SELL, "dry-run", request.client_order_id, {"dry_run": True})
         return request, result
@@ -829,6 +993,12 @@ class MomentumBotRunner:
             "momentum_take_profit_pct": self.settings.momentum_take_profit_pct,
             "momentum_stop_loss_pct": self.settings.momentum_stop_loss_pct,
             "momentum_trailing_stop_pct": self.settings.momentum_trailing_stop_pct,
+            "enabled_market_types": self.settings.enabled_market_types,
+            "allow_leveraged_trading": self.settings.allow_leveraged_trading,
+            "allow_derivatives_trading": self.settings.allow_derivatives_trading,
+            "max_leverage": self.settings.max_leverage,
+            "momentum_entry_mode": self.settings.momentum_entry_mode,
+            "momentum_rotation_mode": self.settings.momentum_rotation_mode,
         }
         self.storage.save_config_snapshot(json.dumps(payload, ensure_ascii=False))
 
@@ -873,7 +1043,8 @@ class MomentumBotRunner:
         prices = self.storage.latest_market_prices()
         lines = ["当前持仓:"]
         for position in positions:
-            price = prices.get(position.symbol)
+            price = prices.get(position.symbol) or prices.get(_spot_symbol(position.symbol))
+            lines.append(f"- {position.symbol} route={position.market_type}/{position.direction} leverage={position.leverage:g}x")
             if price and position.avg_entry_price > 0:
                 pnl = (price - position.avg_entry_price) * position.base_qty
                 return_pct = (price - position.avg_entry_price) / position.avg_entry_price * 100.0
@@ -955,12 +1126,19 @@ class MomentumBotRunner:
             f"止损={self.settings.momentum_stop_loss_pct:.1%}; "
             f"移动止盈回撤={self.settings.momentum_trailing_stop_pct:.1%}"
         )
+        route = (
+            f"markets={','.join(self.settings.enabled_market_types)}; leverage={self.settings.max_leverage:g}x; "
+            f"margin={self.settings.margin_mode}; entry={self.settings.momentum_entry_mode}; "
+            f"veto={'on' if self.settings.ai_risk_veto_enabled else 'off'}; rotation={self.settings.momentum_rotation_mode}"
+        )
+        guard = f"{guard}\n{route}"
         if not decisions:
             return "\n".join([guard, "暂无AI执行决策。"])
         return "\n".join([guard, "最近AI执行决策:", *decisions])
 
     def _lessons_message(self) -> str:
         lessons = self.storage.recent_trade_attributions(limit=12)
+        experience = self.storage.experience_summary()
         if not lessons:
             return "暂无交易归因。"
         return "\n".join(["最近交易归因:", *lessons])
@@ -1032,6 +1210,10 @@ def _order_payload(payload: dict) -> dict:
     if isinstance(data, list) and data and isinstance(data[0], dict):
         return data[0]
     return payload if isinstance(payload, dict) else {}
+
+
+def _spot_symbol(symbol: str) -> str:
+    return symbol[:-5] if symbol.endswith("-SWAP") else symbol
 
 
 def _float_or_zero(value: object) -> float:
