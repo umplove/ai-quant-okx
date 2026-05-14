@@ -3,7 +3,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from okx_quant_bot.ai_reviewer import AiReviewClient, _extract_ai_text, _extract_output_text, _parse_trade_decision
+from okx_quant_bot.ai_reviewer import (
+    AiReviewClient,
+    _extract_ai_text,
+    _extract_output_text,
+    _parse_trade_decision,
+)
 from okx_quant_bot.models import CandidateScore, InfoSignal, MarketTicker
 from okx_quant_bot.momentum import MomentumScan
 from tests.test_strategy_risk import settings_for
@@ -156,10 +161,36 @@ class AiReviewerTests(unittest.TestCase):
         self.assertIn('"action":"buy"', _extract_ai_text(payload))
 
     def test_parse_trade_decision_json(self):
-        decision = _parse_trade_decision('{"action":"sell","confidence":0.8,"reason":"跌破风险线"}')
+        decision = _parse_trade_decision(
+            '{"action":"sell","exit_mode":"sell_partial","confidence":0.8,"reason":"跌破风险线"}'
+        )
 
         self.assertTrue(decision.approved_sell)
+        self.assertEqual(decision.exit_mode, "sell_partial")
         self.assertEqual(decision.reason, "跌破风险线")
+
+    def test_parse_trade_decision_execution_defaults(self):
+        decision = _parse_trade_decision(
+            '{"action":"buy","entry_mode":"split_limit","size_mode":"strong","stop_mode":"trailing",'
+            '"replace_mode":"replace_weakest","confidence":0.9,"reason":"强势突破"}'
+        )
+
+        self.assertTrue(decision.approved_buy)
+        self.assertEqual(decision.entry_mode, "split_limit")
+        self.assertEqual(decision.size_mode, "strong")
+        self.assertEqual(decision.stop_mode, "trailing")
+        self.assertEqual(decision.replace_mode, "replace_weakest")
+
+    def test_invalid_execution_modes_fall_back_safely(self):
+        decision = _parse_trade_decision(
+            '{"action":"buy","entry_mode":"bad","size_mode":"bad","stop_mode":"bad",'
+            '"replace_mode":"bad","confidence":0.9,"reason":"测试"}'
+        )
+
+        self.assertEqual(decision.entry_mode, "market_now")
+        self.assertEqual(decision.size_mode, "normal")
+        self.assertEqual(decision.stop_mode, "fixed")
+        self.assertEqual(decision.replace_mode, "none")
 
 
 def _scan() -> MomentumScan:

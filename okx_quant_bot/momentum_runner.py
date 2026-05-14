@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json
 import time
 import traceback
-import json
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field, replace
 
@@ -59,17 +59,20 @@ class MomentumBotRunner:
         self._review_open_trades(scan)
 
         self._collect_finished_ai_tasks()
+        market_regime = self._current_market_regime()
         ai_note = self._latest_ai_review_text(scan)
         self._sell_positions_with_recent_ai(scan)
+        self._submit_market_regime(scan)
         self._submit_ai_review(scan)
-        self._submit_sell_reviews(scan)
+        self._submit_sell_reviews(scan, market_regime)
         self._collect_finished_ai_tasks(grace_seconds=0.05)
         self._sell_positions_with_recent_ai(scan)
         for candidate in self._ai_learning_candidates(scan):
-            self._submit_buy_review(scan, candidate)
+            self._submit_buy_review(scan, candidate, market_regime)
             self._collect_finished_ai_tasks(grace_seconds=0.05)
-            if self._latest_ai_allows(candidate.symbol, "buy") and self._is_tradable_candidate(candidate):
-                self._buy_and_protect(candidate)
+            decision = self.storage.latest_execution_decision(candidate.symbol, "buy", self._ai_decision_ttl_seconds())
+            if decision and self._is_tradable_or_replaceable(candidate, decision):
+                self._execute_buy_decision(candidate, decision, scan)
 
         if self.training_pool is not None:
             self.training_pool.enqueue_scan(scan, self._strategy_context())
@@ -148,6 +151,18 @@ class MomentumBotRunner:
             return False
         return True
 
+    def _is_tradable_or_replaceable(self, candidate: CandidateScore, decision: dict) -> bool:
+        if not self._execution_buy_allowed(decision):
+            return False
+        if self._is_tradable_candidate(candidate):
+            return True
+        return (
+            self.settings.replace_weak_position_enabled
+            and self.storage.open_position_count() >= self.settings.max_open_positions
+            and str(decision.get("replace_mode")) == "replace_weakest"
+            and not self.storage.get_position(candidate.symbol).is_open
+        )
+
     def _ensure_ai_executor(self) -> ThreadPoolExecutor:
         if self._ai_executor is None:
             workers = max(2, min(8, self.settings.ai_training_workers))
@@ -187,24 +202,20 @@ class MomentumBotRunner:
             return
         self._submit_ai_task("scan:MARKET", self._ai_review_text, scan)
 
-    def _submit_buy_review(self, scan: MomentumScan, candidate: CandidateScore) -> None:
-        self._submit_ai_task(f"buy:{candidate.symbol}", self._ai_buy_decision, scan, candidate)
+    def _submit_market_regime(self, scan: MomentumScan) -> None:
+        if self.settings.market_regime_enabled:
+            self._submit_ai_task("market_regime:MARKET", self._ai_market_regime_decision, scan)
 
-    def _submit_sell_reviews(self, scan: MomentumScan) -> None:
+    def _submit_buy_review(self, scan: MomentumScan, candidate: CandidateScore, market_regime: str) -> None:
+        self._submit_ai_task(f"buy:{candidate.symbol}", self._ai_buy_decision, scan, candidate, market_regime)
+
+    def _submit_sell_reviews(self, scan: MomentumScan, market_regime: str) -> None:
         prices = {ticker.symbol: ticker.last for ticker in scan.tickers}
         for position in self.storage.open_positions():
             price = prices.get(position.symbol)
             if price is None:
                 continue
-            self._submit_ai_task(f"sell:{position.symbol}", self._ai_sell_decision, scan, position, price)
-
-    def _latest_ai_allows(self, symbol: str, intent: str) -> bool:
-        decision = self.storage.latest_ai_decision(symbol, intent, self._ai_decision_ttl_seconds())
-        if not decision:
-            return False
-        action = str(decision.get("action") or "")
-        confidence = float(decision.get("confidence") or 0.0)
-        return action == intent and confidence >= 0.65
+            self._submit_ai_task(f"sell:{position.symbol}", self._ai_sell_decision, scan, position, price, market_regime)
 
     def _ai_decision_ttl_seconds(self) -> int:
         return max(60, int(self.settings.scan_interval_seconds * 3))
@@ -216,38 +227,69 @@ class MomentumBotRunner:
             return ""
         return str(decision.get("reason") or "")[:500]
 
-    def _ai_buy_decision(self, scan: MomentumScan, candidate: CandidateScore):
+    def _current_market_regime(self) -> str:
+        regime = self.storage.latest_market_regime()
+        return str(regime.get("regime")) if regime else "未知"
+
+    def _ai_buy_decision(self, scan: MomentumScan, candidate: CandidateScore, market_regime: str = ""):
         client = AiReviewClient(self.settings)
-        decision = client.decide_buy(scan, candidate, self.storage.open_position_count(), self._strategy_context())
+        decision = client.decide_buy(
+            scan,
+            candidate,
+            self.storage.open_position_count(),
+            self._strategy_context(),
+            market_regime,
+        )
         self._record_ai_decision(candidate.symbol, "buy", decision)
         return decision
 
-    def _ai_sell_decision(self, scan: MomentumScan, position: Position, current_price: float):
+    def _ai_sell_decision(self, scan: MomentumScan, position: Position, current_price: float, market_regime: str = ""):
         client = AiReviewClient(self.settings)
-        decision = client.decide_sell(scan, position, current_price, self._strategy_context())
+        decision = client.decide_sell(scan, position, current_price, self._strategy_context(), market_regime)
         self._record_ai_decision(position.symbol, "sell", decision)
         return decision
 
+    def _ai_market_regime_decision(self, scan: MomentumScan) -> None:
+        regime = AiReviewClient(self.settings).decide_market_regime(scan, self._strategy_context())
+        if regime.ok:
+            self.storage.save_market_regime(regime.regime, regime.confidence, regime.reason, regime.raw_text)
+        else:
+            self.storage.save_bot_error("market_regime", "AI行情状态判断失败", regime.error)
+
     def _record_ai_decision(self, symbol: str, intent: str, decision) -> None:
-        self.storage.save_ai_decision(
-            symbol,
-            intent,
-            decision.action if decision.ok else "hold",
-            float(decision.confidence),
-            decision.reason if decision.ok else decision.error,
-            decision.raw_text,
+        action = decision.action if decision.ok else "hold"
+        reason = decision.reason if decision.ok else decision.error
+        entry_mode = getattr(decision, "entry_mode", "wait")
+        exit_mode = getattr(decision, "exit_mode", "hold")
+        if action == "buy" and entry_mode == "wait":
+            entry_mode = "market_now"
+        if action == "sell" and exit_mode == "hold":
+            exit_mode = "sell_all"
+        self.storage.save_ai_decision(symbol, intent, action, float(decision.confidence), reason, decision.raw_text)
+        self.storage.save_execution_decision(
+            symbol=symbol,
+            intent=intent,
+            action=action,
+            entry_mode=entry_mode,
+            exit_mode=exit_mode,
+            size_mode=getattr(decision, "size_mode", "normal"),
+            stop_mode=getattr(decision, "stop_mode", "fixed"),
+            replace_mode=getattr(decision, "replace_mode", "none"),
+            confidence=float(decision.confidence),
+            reason=reason,
+            raw=decision.raw_text,
         )
         self.storage.save_ai_call_audit(
             symbol=symbol,
             intent=intent,
             ok=decision.ok,
-            action=decision.action if decision.ok else "hold",
+            action=action,
             confidence=float(decision.confidence),
             prompt_chars=int(getattr(decision, "prompt_chars", 0)),
             response_chars=int(getattr(decision, "response_chars", 0)),
             duration_ms=int(getattr(decision, "duration_ms", 0)),
             error="" if decision.ok else decision.error,
-            reason=decision.reason if decision.ok else decision.error,
+            reason=reason,
             prompt_tokens=int(getattr(decision, "prompt_tokens", 0)),
             completion_tokens=int(getattr(decision, "completion_tokens", 0)),
             total_tokens=int(getattr(decision, "total_tokens", 0)),
@@ -261,29 +303,55 @@ class MomentumBotRunner:
             "\n".join(self.storage.recent_trade_reviews()),
             "\n".join(self.storage.recent_intelligence(self.settings.intelligence_max_items)),
             "\n".join(self.storage.recent_ai_decisions()),
+            "\n".join(self.storage.recent_trade_attributions(limit=8)),
+            "\n".join(self.storage.recent_market_regimes(limit=3)),
         ]
         return "\n".join(part for part in parts if part)
 
-    def _buy_and_protect(self, candidate: CandidateScore) -> None:
-        quote_amount = target_position_usdt(self.settings)
+    def _execute_buy_decision(self, candidate: CandidateScore, decision: dict, scan: MomentumScan) -> None:
+        if not self._execution_buy_allowed(decision):
+            return
+        if self.storage.open_position_count() >= self.settings.max_open_positions:
+            if str(decision.get("replace_mode")) != "replace_weakest":
+                return
+            if not self._replace_weakest_position(scan, f"换仓买入{candidate.symbol}: {decision.get('reason') or ''}"):
+                return
+
+        entry_mode = str(decision.get("entry_mode") or "market_now")
+        quote_amount = self._target_quote_amount(str(decision.get("size_mode") or "normal"))
+        reason = str(decision.get("reason") or candidate.reason)
+        if entry_mode in {"wait", "breakout_confirm"}:
+            self.storage.save_strategy_lesson(candidate.symbol, 0.0, 0.0, f"execution_wait:{entry_mode}:{reason}", "")
+            return
+        if entry_mode == "limit_pullback" and self.settings.limit_order_enabled:
+            self._place_limit_buy(candidate, quote_amount, candidate.price * 0.997, reason)
+            return
+        if entry_mode == "split_limit" and self.settings.limit_order_enabled:
+            self._place_split_limit_buys(candidate, quote_amount, reason)
+            return
+        self._buy_and_protect(candidate, quote_amount, reason)
+
+    def _execution_buy_allowed(self, decision: dict) -> bool:
+        return (
+            str(decision.get("action") or "") == "buy"
+            and float(decision.get("confidence") or 0.0) >= 0.65
+            and self.settings.ai_execution_decisions_enabled
+        )
+
+    def _target_quote_amount(self, size_mode: str) -> float:
+        multipliers = {"explore": 0.3, "reduced": 0.5, "normal": 1.0, "strong": 1.5}
+        return target_position_usdt(self.settings) * multipliers.get(size_mode, 1.0)
+
+    def _buy_and_protect(self, candidate: CandidateScore, quote_amount: float | None = None, reason: str | None = None) -> None:
+        quote_amount = quote_amount if quote_amount is not None else target_position_usdt(self.settings)
+        reason = reason or candidate.reason
         if not self.settings.trading_enabled:
-            request, result = self._dry_run_buy(candidate, quote_amount)
+            request, result = self._dry_run_buy(candidate, quote_amount, "market")
         else:
-            request, result = self.exchange.place_market_buy_quote(
-                candidate.symbol,
-                quote_amount,
-                f"ai_buy:{candidate.reason}",
-            )
+            request, result = self.exchange.place_market_buy_quote(candidate.symbol, quote_amount, f"ai_buy:{reason}")
         self.storage.save_order(request, result)
         if not result.ok:
-            self.storage.save_bot_error("order_buy", f"{candidate.symbol} 买入失败", result.error or "unknown")
-            self.storage.save_strategy_lesson(
-                candidate.symbol,
-                0.0,
-                0.0,
-                f"order_failed:{result.error or 'unknown'}",
-                str(result.raw),
-            )
+            self._record_execution_failure(candidate.symbol, "买入失败", result.error or "unknown", result.raw)
             return
 
         fill_price = _filled_price(result) or candidate.price
@@ -293,14 +361,23 @@ class MomentumBotRunner:
         stop_order = self._place_stop_loss(plan)
         self.storage.save_stop_loss_order(stop_order)
         if not stop_order.ok:
-            self.storage.save_bot_error("stop_loss", f"{candidate.symbol} 止损单失败", stop_order.error or "unknown")
-            self.storage.save_strategy_lesson(
-                candidate.symbol,
-                0.0,
-                0.0,
-                f"stop_loss_failed:{stop_order.error or 'unknown'}",
-                str(stop_order.raw),
-            )
+            self._record_execution_failure(candidate.symbol, "止损单失败", stop_order.error or "unknown", stop_order.raw)
+
+    def _place_limit_buy(self, candidate: CandidateScore, quote_amount: float, price: float, reason: str) -> None:
+        if not self.settings.trading_enabled:
+            request, result = self._dry_run_limit_buy(candidate, quote_amount, price, reason)
+        else:
+            request, result = self.exchange.place_limit_buy_quote(candidate.symbol, quote_amount, price, f"ai_limit_buy:{reason}")
+        self.storage.save_order(request, result)
+        if not result.ok:
+            self._record_execution_failure(candidate.symbol, "限价买入失败", result.error or "unknown", result.raw)
+
+    def _place_split_limit_buys(self, candidate: CandidateScore, quote_amount: float, reason: str) -> None:
+        parts = max(1, self.settings.split_order_parts)
+        part_amount = quote_amount / parts
+        for idx in range(parts):
+            price = candidate.price * (1 - 0.003 * (idx + 1))
+            self._place_limit_buy(candidate, part_amount, price, f"{reason}; split={idx + 1}/{parts}")
 
     def _sell_positions_with_recent_ai(self, scan: MomentumScan) -> None:
         prices = {ticker.symbol: ticker.last for ticker in scan.tickers}
@@ -308,54 +385,128 @@ class MomentumBotRunner:
             price = prices.get(position.symbol)
             if price is None:
                 continue
-            decision = self.storage.latest_ai_decision(position.symbol, "sell", self._ai_decision_ttl_seconds())
+            decision = self.storage.latest_execution_decision(position.symbol, "sell", self._ai_decision_ttl_seconds())
             if not decision:
                 continue
-            if str(decision.get("action")) == "sell" and float(decision.get("confidence") or 0.0) >= 0.65:
-                self._sell_position(position, price, str(decision.get("reason") or "AI建议卖出"))
+            if str(decision.get("action")) != "sell" or float(decision.get("confidence") or 0.0) < 0.65:
+                continue
+            exit_mode = str(decision.get("exit_mode") or "sell_all")
+            reason = str(decision.get("reason") or "AI建议卖出")
+            if exit_mode == "sell_partial":
+                self._sell_position(position, price, reason, fraction=self.settings.partial_sell_fractions[0])
+            elif exit_mode == "trail_profit":
+                self._move_stop(position, price * (1 - self.settings.trailing_stop_pct), "AI追踪止盈")
+            elif exit_mode == "move_to_breakeven":
+                self._move_stop(position, position.avg_entry_price, "AI保本止损")
+            elif exit_mode == "sell_all":
+                self._sell_position(position, price, reason, fraction=1.0)
 
     def _sell_positions_with_ai(self, scan: MomentumScan) -> None:
         self._sell_positions_with_recent_ai(scan)
 
-    def _sell_position(self, position: Position, current_price: float, reason: str) -> None:
+    def _sell_position(self, position: Position, current_price: float, reason: str, fraction: float = 1.0) -> None:
+        sell_qty = position.base_qty * max(0.0, min(fraction, 1.0))
+        if sell_qty <= 0:
+            return
         if not self.settings.trading_enabled:
-            request, result = self._dry_run_sell(position, reason)
+            request, result = self._dry_run_sell(position, reason, sell_qty)
         else:
-            request, result = self.exchange.place_market_sell_base(
-                position.symbol,
-                position.base_qty,
-                f"ai_sell:{reason}",
-            )
+            request, result = self.exchange.place_market_sell_base(position.symbol, sell_qty, f"ai_sell:{reason}")
         self.storage.save_order(request, result)
         if not result.ok:
-            self.storage.save_bot_error("order_sell", f"{position.symbol} 卖出失败", result.error or "unknown")
-            self.storage.save_strategy_lesson(
-                position.symbol,
-                0.0,
-                0.0,
-                f"sell_failed:{result.error or 'unknown'}",
-                str(result.raw),
-            )
+            self._record_execution_failure(position.symbol, "卖出失败", result.error or "unknown", result.raw)
             return
-        pnl = (current_price - position.avg_entry_price) * position.base_qty
+        pnl = (current_price - position.avg_entry_price) * sell_qty
         return_pct = 0.0 if position.avg_entry_price <= 0 else (
             (current_price - position.avg_entry_price) / position.avg_entry_price * 100.0
         )
-        self.storage.save_position(Position(symbol=position.symbol))
+        remaining = position.base_qty - sell_qty
+        if remaining > 1e-12:
+            self.storage.save_position(Position(position.symbol, remaining, position.avg_entry_price, max(position.highest_price, current_price)))
+        else:
+            self.storage.save_position(Position(symbol=position.symbol))
         self.storage.save_strategy_lesson(position.symbol, pnl, return_pct, f"ai_sell:{reason}", str(result.raw))
+        self._record_trade_attribution(position.symbol, pnl, return_pct, f"卖出完成: {reason}")
 
-    def _dry_run_buy(self, candidate: CandidateScore, quote_amount: float):
+    def _replace_weakest_position(self, scan: MomentumScan, reason: str) -> bool:
+        prices = {ticker.symbol: ticker.last for ticker in scan.tickers}
+        weakest: tuple[float, Position, float] | None = None
+        for position in self.storage.open_positions():
+            price = prices.get(position.symbol, position.avg_entry_price)
+            return_pct = 0.0 if position.avg_entry_price <= 0 else (price - position.avg_entry_price) / position.avg_entry_price * 100.0
+            if weakest is None or return_pct < weakest[0]:
+                weakest = (return_pct, position, price)
+        if weakest is None:
+            return False
+        _, position, price = weakest
+        self._sell_position(position, price, reason, fraction=1.0)
+        return not self.storage.get_position(position.symbol).is_open
+
+    def _move_stop(self, position: Position, stop_price: float, reason: str) -> None:
+        stop_order = self._place_stop_loss_for_position(position, stop_price)
+        self.storage.save_stop_loss_order(stop_order)
+        if stop_order.ok:
+            self.storage.save_strategy_lesson(position.symbol, 0.0, 0.0, f"{reason}: stop={stop_price:.8g}", str(stop_order.raw))
+        else:
+            self._record_execution_failure(position.symbol, f"{reason}失败", stop_order.error or "unknown", stop_order.raw)
+
+    def _place_stop_loss_for_position(self, position: Position, stop_price: float) -> StopLossOrder:
+        if not self.settings.trading_enabled:
+            return StopLossOrder(
+                symbol=position.symbol,
+                algo_id="dry-run",
+                client_order_id=OkxRestClient.client_order_id("DRYSL", position.symbol),
+                stop_price=stop_price,
+                size=position.base_qty,
+                ok=True,
+                raw={"dry_run": True},
+            )
+        return self.exchange.place_stop_loss_order(position.symbol, position.base_qty, stop_price)
+
+    def _record_execution_failure(self, symbol: str, summary: str, error: str, raw: dict) -> None:
+        self.storage.save_bot_error("execution", f"{symbol} {summary}", error)
+        self.storage.save_strategy_lesson(symbol, 0.0, 0.0, f"execution_failed:{summary}:{error}", str(raw))
+        self.storage.save_trade_attribution(symbol, 0.0, 0.0, "执行失败", 1.0, f"{summary}: {error}", self._current_market_regime(), str(raw))
+
+    def _record_trade_attribution(self, symbol: str, pnl: float, return_pct: float, summary: str) -> None:
+        if not self.settings.ai_review_enabled:
+            self.storage.save_trade_attribution(symbol, pnl, return_pct, "未知", 0.0, summary, self._current_market_regime(), "")
+            return
+        attribution = AiReviewClient(self.settings).attribute_trade(symbol, pnl, return_pct, summary, self._strategy_context())
+        if getattr(attribution, "ok", False) is True:
+            category = attribution.category if isinstance(attribution.category, str) else "未知"
+            reason = attribution.reason if isinstance(attribution.reason, str) else summary
+            raw_text = attribution.raw_text if isinstance(attribution.raw_text, str) else ""
+            try:
+                confidence = float(attribution.confidence)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            self.storage.save_trade_attribution(
+                symbol,
+                pnl,
+                return_pct,
+                category,
+                confidence,
+                reason,
+                self._current_market_regime(),
+                raw_text,
+            )
+        else:
+            error = getattr(attribution, "error", "") or summary
+            self.storage.save_trade_attribution(symbol, pnl, return_pct, "未知", 0.0, str(error), self._current_market_regime(), "")
+
+    def _dry_run_buy(self, candidate: CandidateScore, quote_amount: float, order_type: str = "market"):
         from okx_quant_bot.models import OrderRequest
 
         request = OrderRequest(
             symbol=candidate.symbol,
             side=Side.BUY,
             size=quote_amount,
-            order_type="market",
+            order_type=order_type,
             price=None,
             client_order_id=OkxRestClient.client_order_id("DRYB", candidate.symbol),
             reason=f"ai_buy:{candidate.reason}",
-            target_currency="quote_ccy",
+            target_currency="quote_ccy" if order_type == "market" else None,
         )
         result = OrderResult(
             ok=True,
@@ -367,26 +518,35 @@ class MomentumBotRunner:
         )
         return request, result
 
-    def _dry_run_sell(self, position: Position, reason: str):
+    def _dry_run_limit_buy(self, candidate: CandidateScore, quote_amount: float, price: float, reason: str):
         from okx_quant_bot.models import OrderRequest
 
         request = OrderRequest(
+            symbol=candidate.symbol,
+            side=Side.BUY,
+            size=quote_amount / price if price > 0 else 0.0,
+            order_type="limit",
+            price=price,
+            client_order_id=OkxRestClient.client_order_id("DRYLB", candidate.symbol),
+            reason=f"ai_limit_buy:{reason}",
+        )
+        result = OrderResult(True, candidate.symbol, Side.BUY, "dry-run-limit", request.client_order_id, {"dry_run": True})
+        return request, result
+
+    def _dry_run_sell(self, position: Position, reason: str, size: float | None = None):
+        from okx_quant_bot.models import OrderRequest
+
+        sell_size = position.base_qty if size is None else size
+        request = OrderRequest(
             symbol=position.symbol,
             side=Side.SELL,
-            size=position.base_qty,
+            size=sell_size,
             order_type="market",
             price=None,
             client_order_id=OkxRestClient.client_order_id("DRYS", position.symbol),
             reason=f"ai_sell:{reason}",
         )
-        result = OrderResult(
-            ok=True,
-            symbol=position.symbol,
-            side=Side.SELL,
-            order_id="dry-run",
-            client_order_id=request.client_order_id,
-            raw={"dry_run": True},
-        )
+        result = OrderResult(True, position.symbol, Side.SELL, "dry-run", request.client_order_id, {"dry_run": True})
         return request, result
 
     def _place_stop_loss(self, plan) -> StopLossOrder:
@@ -405,20 +565,9 @@ class MomentumBotRunner:
     def _ai_review_text(self, scan: MomentumScan) -> str:
         if not self.settings.ai_review_enabled:
             return ""
-        review = AiReviewClient(self.settings).review_scan(
-            scan,
-            self.storage.open_position_count(),
-            self._strategy_context(),
-        )
+        review = AiReviewClient(self.settings).review_scan(scan, self.storage.open_position_count(), self._strategy_context())
         symbol = scan.best.symbol if scan.best else "MARKET"
-        self.storage.save_ai_decision(
-            symbol,
-            "scan",
-            "hold",
-            0.0,
-            review.text if review.ok else review.error,
-            review.text,
-        )
+        self.storage.save_ai_decision(symbol, "scan", "hold", 0.0, review.text if review.ok else review.error, review.text)
         self.storage.save_ai_call_audit(
             symbol=symbol,
             intent="scan",
@@ -438,7 +587,7 @@ class MomentumBotRunner:
         )
         if review.ok:
             return review.text
-        return "" if review.error == "timeout" else f"AI unavailable: {review.error}"
+        return "" if review.error == "timeout" else f"AI不可用: {review.error}"
 
     def _review_open_trades(self, scan: MomentumScan) -> None:
         if not self.settings.trade_review_enabled:
@@ -446,13 +595,7 @@ class MomentumBotRunner:
         reviews = TradeReviewEngine().mark_to_market(self.storage.open_positions(), scan.tickers, note="auto review")
         for review in reviews:
             self.storage.save_trade_review(review)
-            self.storage.save_strategy_lesson(
-                review.symbol,
-                review.pnl_usdt,
-                review.return_pct,
-                review.summary,
-                review.raw,
-            )
+            self.storage.save_strategy_lesson(review.symbol, review.pnl_usdt, review.return_pct, review.summary, review.raw)
 
     def _send_money_report(
         self,
@@ -485,13 +628,7 @@ class MomentumBotRunner:
         self.notifier.send_money(message)
         if scan is not None:
             best = scan.best.symbol if scan.best else "NONE"
-            self.storage.save_strategy_lesson(
-                symbol=best,
-                pnl_usdt=float(snapshot["pnl"]),
-                return_pct=float(snapshot["return_pct"]),
-                summary="资金快照",
-                raw=message,
-            )
+            self.storage.save_strategy_lesson(best, float(snapshot["pnl"]), float(snapshot["return_pct"]), "资金快照", message)
 
     def _money_snapshot(self) -> dict[str, float]:
         equity = self._account_equity()
@@ -541,6 +678,12 @@ class MomentumBotRunner:
                 self.notifier.send(self._errors_message())
             elif action == "shadow":
                 self.notifier.send(self._shadow_message())
+            elif action == "execution":
+                self.notifier.send(self._execution_message())
+            elif action == "lessons":
+                self.notifier.send(self._lessons_message())
+            elif action == "market":
+                self.notifier.send(self._market_message())
 
     def _is_paused(self) -> bool:
         return self.storage.get_state("bot_paused", "0") == "1"
@@ -560,6 +703,9 @@ class MomentumBotRunner:
             "ai_training_enabled": self.settings.ai_training_enabled,
             "ai_training_workers": self.settings.ai_training_workers,
             "ai_weekly_token_target": self.settings.ai_weekly_token_target,
+            "ai_execution_decisions_enabled": self.settings.ai_execution_decisions_enabled,
+            "limit_order_enabled": self.settings.limit_order_enabled,
+            "replace_weak_position_enabled": self.settings.replace_weak_position_enabled,
             "risk_halt_enabled": self.settings.risk_halt_enabled,
         }
         self.storage.save_config_snapshot(json.dumps(payload, ensure_ascii=False))
@@ -576,6 +722,7 @@ class MomentumBotRunner:
                     f"启动诊断: 模式={mode}; 下单={trading}; AI={ai}; AI节奏={cadence}",
                     f"持仓上限={self.settings.max_open_positions}; 扫描间隔={self.settings.scan_interval_seconds}s",
                     f"AI候选=top {self.settings.ai_review_max_candidates}; 探索比例={self.settings.ai_exploration_fraction:.0%}",
+                    f"执行决策={'开启' if self.settings.ai_execution_decisions_enabled else '关闭'}; 限价单={'开启' if self.settings.limit_order_enabled else '关闭'}",
                     f"风险熔断={'开启' if self.settings.risk_halt_enabled else '关闭'}; OKX技能信号源={len(self.settings.okx_skill_signal_urls)}",
                     f"AI配置提醒: {warning or '正常'}",
                 ]
@@ -590,6 +737,7 @@ class MomentumBotRunner:
                 f"Base URL={self.settings.openai_base_url}",
                 f"协议={self.settings.openai_api_mode}; 超时={self.settings.ai_review_timeout_seconds}s; 重试={self.settings.ai_request_retries}",
                 f"训练线程={self.settings.ai_training_workers}; 周目标={self.settings.ai_weekly_token_target} token",
+                f"执行决策={'开启' if self.settings.ai_execution_decisions_enabled else '关闭'}; 行情状态={'开启' if self.settings.market_regime_enabled else '关闭'}",
                 f"配置自检: {warning or '正常'}",
                 self.storage.recent_ai_call_summary(),
             ]
@@ -660,6 +808,24 @@ class MomentumBotRunner:
         if not shadows:
             return "暂无影子全市场建议。"
         return "\n".join(["影子全市场最近建议:", *shadows])
+
+    def _execution_message(self) -> str:
+        decisions = self.storage.recent_execution_decisions(limit=12)
+        if not decisions:
+            return "暂无AI执行决策。"
+        return "\n".join(["最近AI执行决策:", *decisions])
+
+    def _lessons_message(self) -> str:
+        lessons = self.storage.recent_trade_attributions(limit=12)
+        if not lessons:
+            return "暂无交易归因。"
+        return "\n".join(["最近交易归因:", *lessons])
+
+    def _market_message(self) -> str:
+        regimes = self.storage.recent_market_regimes(limit=6)
+        if not regimes:
+            return "暂无AI行情状态。"
+        return "\n".join(["AI行情状态:", *regimes])
 
 
 def _filled_price(result: OrderResult) -> float | None:

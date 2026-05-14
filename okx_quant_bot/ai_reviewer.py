@@ -12,6 +12,25 @@ from okx_quant_bot.models import CandidateScore, InfoSignal, Position
 from okx_quant_bot.momentum import MomentumScan
 
 
+ENTRY_MODES = {"market_now", "limit_pullback", "split_limit", "breakout_confirm", "wait"}
+EXIT_MODES = {"hold", "sell_all", "sell_partial", "trail_profit", "move_to_breakeven"}
+SIZE_MODES = {"explore", "normal", "strong", "reduced"}
+STOP_MODES = {"fixed", "wide", "tight", "breakeven", "trailing"}
+REPLACE_MODES = {"none", "replace_weakest", "free_cash_only"}
+ATTRIBUTION_CATEGORIES = {
+    "追高",
+    "假突破",
+    "流动性不足",
+    "新闻误判",
+    "止损太紧",
+    "止盈太早",
+    "入场太晚",
+    "执行失败",
+    "未知",
+}
+MARKET_REGIMES = {"单边上涨", "震荡", "急跌反弹", "高波动插针", "主流吸血", "山寨轮动"}
+
+
 @dataclass(frozen=True)
 class AiReview:
     ok: bool
@@ -35,6 +54,11 @@ class AiTradeDecision:
     reason: str = ""
     raw_text: str = ""
     error: str = ""
+    entry_mode: str = "wait"
+    exit_mode: str = "hold"
+    size_mode: str = "normal"
+    stop_mode: str = "fixed"
+    replace_mode: str = "none"
     prompt_chars: int = 0
     response_chars: int = 0
     duration_ms: int = 0
@@ -51,6 +75,26 @@ class AiTradeDecision:
     @property
     def approved_sell(self) -> bool:
         return self.ok and self.action == "sell" and self.confidence >= 0.65
+
+
+@dataclass(frozen=True)
+class AiMarketRegime:
+    ok: bool
+    regime: str = "震荡"
+    confidence: float = 0.0
+    reason: str = ""
+    raw_text: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class AiTradeAttribution:
+    ok: bool
+    category: str = "未知"
+    confidence: float = 0.0
+    reason: str = ""
+    raw_text: str = ""
+    error: str = ""
 
 
 class AiReviewClient:
@@ -96,8 +140,9 @@ class AiReviewClient:
         candidate: CandidateScore,
         open_position_count: int,
         strategy_memory: str = "",
+        market_regime: str = "",
     ) -> AiTradeDecision:
-        prompt = _buy_prompt(self.settings, scan, candidate, open_position_count, strategy_memory)
+        prompt = _buy_prompt(self.settings, scan, candidate, open_position_count, strategy_memory, market_regime)
         return self._decide(prompt)
 
     def decide_sell(
@@ -106,9 +151,29 @@ class AiReviewClient:
         position: Position,
         current_price: float,
         strategy_memory: str = "",
+        market_regime: str = "",
     ) -> AiTradeDecision:
-        prompt = _sell_prompt(self.settings, scan, position, current_price, strategy_memory)
+        prompt = _sell_prompt(self.settings, scan, position, current_price, strategy_memory, market_regime)
         return self._decide(prompt)
+
+    def decide_market_regime(self, scan: MomentumScan, strategy_memory: str = "") -> AiMarketRegime:
+        result = self._complete(_market_regime_prompt(scan, strategy_memory))
+        if not result.ok:
+            return AiMarketRegime(False, error=result.error)
+        return _parse_market_regime(result.raw_text)
+
+    def attribute_trade(
+        self,
+        symbol: str,
+        pnl_usdt: float,
+        return_pct: float,
+        summary: str,
+        strategy_memory: str = "",
+    ) -> AiTradeAttribution:
+        result = self._complete(_attribution_prompt(symbol, pnl_usdt, return_pct, summary, strategy_memory))
+        if not result.ok:
+            return AiTradeAttribution(False, error=result.error)
+        return _parse_trade_attribution(result.raw_text)
 
     def complete_training(self, prompt: str) -> AiTradeDecision:
         return self._complete(prompt)
@@ -125,6 +190,11 @@ class AiReviewClient:
             reason=parsed.reason,
             raw_text=parsed.raw_text,
             error=parsed.error,
+            entry_mode=parsed.entry_mode,
+            exit_mode=parsed.exit_mode,
+            size_mode=parsed.size_mode,
+            stop_mode=parsed.stop_mode,
+            replace_mode=parsed.replace_mode,
             prompt_chars=result.prompt_chars,
             response_chars=result.response_chars,
             duration_ms=result.duration_ms,
@@ -246,18 +316,12 @@ class AiReviewClient:
 
 def _instructions() -> str:
     return (
-        "你是加密货币模拟盘交易训练助手。交易决策必须只输出 JSON，不要 Markdown。"
-        "JSON 格式: {\"action\":\"buy|hold|sell\",\"confidence\":0.0,\"reason\":\"一句中文原因\"}。"
-        "原因必须使用中文。不要承诺一定盈利。不要建议移除止损。"
+        "你是加密货币模拟盘交易训练助手。交易和执行决策必须只输出 JSON，不要 Markdown。"
+        "原因必须使用中文，不要承诺一定盈利，不要建议移除止损。"
     )
 
 
-def _scan_prompt(
-    settings: Settings,
-    scan: MomentumScan,
-    open_position_count: int,
-    strategy_memory: str = "",
-) -> str:
+def _scan_prompt(settings: Settings, scan: MomentumScan, open_position_count: int, strategy_memory: str = "") -> str:
     candidates = scan.candidates[: settings.ai_review_max_candidates]
     lines = [
         "复盘本轮 OKX 现货动量扫描，只输出一句中文资金结论。",
@@ -279,10 +343,13 @@ def _buy_prompt(
     candidate: CandidateScore,
     open_position_count: int,
     strategy_memory: str = "",
+    market_regime: str = "",
 ) -> str:
     info_by_symbol = _group_info(scan.info_signals)
     lines = [
-        "判断是否允许买入这个候选币。只输出 JSON。",
+        "判断是否允许买入这个候选币，并决定具体执行方式。只输出 JSON。",
+        'JSON格式: {"action":"buy|hold","entry_mode":"market_now|limit_pullback|split_limit|breakout_confirm|wait","size_mode":"explore|normal|strong|reduced","stop_mode":"fixed|wide|tight|breakeven|trailing","replace_mode":"none|replace_weakest|free_cash_only","confidence":0.0,"reason":"中文原因"}',
+        f"行情状态: {market_regime or '未知'}",
         f"候选: {candidate.symbol}",
         f"价格: {candidate.price:.8g}",
         f"24h涨幅: {candidate.change_pct_24h * 100:.2f}%",
@@ -305,12 +372,15 @@ def _sell_prompt(
     position: Position,
     current_price: float,
     strategy_memory: str = "",
+    market_regime: str = "",
 ) -> str:
     pnl = (current_price - position.avg_entry_price) * position.base_qty
     return_pct = 0.0 if position.avg_entry_price <= 0 else (current_price - position.avg_entry_price) / position.avg_entry_price * 100
     info_by_symbol = _group_info(scan.info_signals)
     lines = [
-        "判断当前持仓是否应该市价卖出。只输出 JSON。",
+        "判断当前持仓是否应该卖出或调整止盈止损。只输出 JSON。",
+        'JSON格式: {"action":"hold|sell","exit_mode":"hold|sell_all|sell_partial|trail_profit|move_to_breakeven","confidence":0.0,"reason":"中文原因"}',
+        f"行情状态: {market_regime or '未知'}",
         f"持仓: {position.symbol}",
         f"成本: {position.avg_entry_price:.8g}",
         f"现价: {current_price:.8g}",
@@ -322,6 +392,36 @@ def _sell_prompt(
     lines.extend(_signal_lines(info_by_symbol.get(position.symbol, []), limit=settings.intelligence_max_items))
     lines.extend(["策略经验:", strategy_memory or "- 暂无"])
     return "\n".join(lines)
+
+
+def _market_regime_prompt(scan: MomentumScan, strategy_memory: str = "") -> str:
+    lines = [
+        "判断当前加密市场状态。只输出 JSON。",
+        'JSON格式: {"regime":"单边上涨|震荡|急跌反弹|高波动插针|主流吸血|山寨轮动","confidence":0.0,"reason":"中文原因"}',
+        "候选和行情:",
+    ]
+    for candidate in scan.candidates[:20]:
+        lines.append(
+            f"- {candidate.symbol}: 价格{candidate.price:.8g}, 24h涨幅{candidate.change_pct_24h * 100:.2f}%, "
+            f"振幅{candidate.amplitude_pct_24h * 100:.2f}%, 得分{candidate.total_score:.2f}, 原因{candidate.reason}"
+        )
+    lines.extend(["策略经验:", strategy_memory or "- 暂无"])
+    return "\n".join(lines)
+
+
+def _attribution_prompt(symbol: str, pnl_usdt: float, return_pct: float, summary: str, strategy_memory: str = "") -> str:
+    return "\n".join(
+        [
+            "为一次模拟盘交易做归因。只输出 JSON。",
+            'JSON格式: {"category":"追高|假突破|流动性不足|新闻误判|止损太紧|止盈太早|入场太晚|执行失败|未知","confidence":0.0,"reason":"中文原因"}',
+            f"币种: {symbol}",
+            f"盈亏: {pnl_usdt:+.2f} USDT",
+            f"收益率: {return_pct:+.2f}%",
+            f"事件摘要: {summary}",
+            "策略经验:",
+            strategy_memory or "- 暂无",
+        ]
+    )
 
 
 def _candidate_lines(candidate: CandidateScore, signals: list[InfoSignal]) -> list[str]:
@@ -353,10 +453,56 @@ def _group_info(signals: list[InfoSignal]) -> dict[str, list[InfoSignal]]:
 
 def _parse_trade_decision(text: str) -> AiTradeDecision:
     raw_text = text
+    payload = _json_payload(text)
+    if payload is None:
+        return AiTradeDecision(False, raw_text=raw_text, error="AI 决策 JSON 解析失败。")
+    action = _choice(payload.get("action"), {"buy", "hold", "sell"}, "hold")
+    confidence = _confidence(payload.get("confidence"))
+    return AiTradeDecision(
+        True,
+        action=action,
+        confidence=confidence,
+        reason=str(payload.get("reason") or "")[:500],
+        raw_text=raw_text,
+        entry_mode=_choice(payload.get("entry_mode"), ENTRY_MODES, "market_now" if action == "buy" else "wait"),
+        exit_mode=_choice(payload.get("exit_mode"), EXIT_MODES, "sell_all" if action == "sell" else "hold"),
+        size_mode=_choice(payload.get("size_mode"), SIZE_MODES, "normal"),
+        stop_mode=_choice(payload.get("stop_mode"), STOP_MODES, "fixed"),
+        replace_mode=_choice(payload.get("replace_mode"), REPLACE_MODES, "none"),
+    )
+
+
+def _parse_market_regime(text: str) -> AiMarketRegime:
+    payload = _json_payload(text)
+    if payload is None:
+        return AiMarketRegime(False, error="AI 行情状态 JSON 解析失败。")
+    return AiMarketRegime(
+        True,
+        regime=_choice(payload.get("regime"), MARKET_REGIMES, "震荡"),
+        confidence=_confidence(payload.get("confidence")),
+        reason=str(payload.get("reason") or "")[:500],
+        raw_text=text,
+    )
+
+
+def _parse_trade_attribution(text: str) -> AiTradeAttribution:
+    payload = _json_payload(text)
+    if payload is None:
+        return AiTradeAttribution(False, error="AI 归因 JSON 解析失败。")
+    return AiTradeAttribution(
+        True,
+        category=_choice(payload.get("category"), ATTRIBUTION_CATEGORIES, "未知"),
+        confidence=_confidence(payload.get("confidence")),
+        reason=str(payload.get("reason") or "")[:500],
+        raw_text=text,
+    )
+
+
+def _json_payload(text: str) -> dict | None:
     text = text.strip()
     if "```" in text:
         text = text.replace("```json", "```")
-        text = next((part.strip() for part in text.split("```") if "action" in part), text)
+        text = next((part.strip() for part in text.split("```") if "{" in part and "}" in part), text)
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
@@ -364,17 +510,21 @@ def _parse_trade_decision(text: str) -> AiTradeDecision:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        return AiTradeDecision(False, raw_text=raw_text, error="AI 决策 JSON 解析失败。")
-    action = str(payload.get("action") or "hold").strip().lower()
-    if action not in {"buy", "hold", "sell"}:
-        action = "hold"
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _choice(value, allowed: set[str], default: str) -> str:
+    candidate = str(value or "").strip()
+    return candidate if candidate in allowed else default
+
+
+def _confidence(value) -> float:
     try:
-        confidence = float(payload.get("confidence") or 0.0)
+        confidence = float(value or 0.0)
     except (TypeError, ValueError):
         confidence = 0.0
-    confidence = max(0.0, min(confidence, 1.0))
-    reason = str(payload.get("reason") or "")[:500]
-    return AiTradeDecision(True, action, confidence, reason, raw_text)
+    return max(0.0, min(confidence, 1.0))
 
 
 def _extract_ai_text(payload: dict) -> str:
@@ -420,7 +570,7 @@ def _summarize_reasoning_fallback(text: str) -> str:
     if any(word in compact for word in ("停止", "风险偏高", "不建议", "暂不")):
         return '{"action":"hold","confidence":0.7,"reason":"模型推理认为风险偏高，暂不交易"}'
     if any(word in compact for word in ("买入", "允许", "风险可控", "继续运行")):
-        return '{"action":"buy","confidence":0.7,"reason":"模型推理认为风险可控"}'
+        return '{"action":"buy","entry_mode":"market_now","confidence":0.7,"reason":"模型推理认为风险可控"}'
     return '{"action":"hold","confidence":0.5,"reason":"模型只返回推理，未给出明确交易结论"}'
 
 
@@ -443,11 +593,7 @@ def _extract_usage(payload: dict) -> dict[str, int]:
     prompt_tokens = int(usage.get("prompt_tokens") or 0)
     completion_tokens = int(usage.get("completion_tokens") or 0)
     total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-    }
+    return {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
 
 
 def _estimate_tokens(text: str) -> int:

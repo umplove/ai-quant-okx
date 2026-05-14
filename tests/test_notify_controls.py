@@ -51,6 +51,9 @@ class NotifyControlsTests(unittest.TestCase):
                     {"update_id": 17, "message": {"text": "/health", "chat": {"id": 123}}},
                     {"update_id": 18, "message": {"text": "/errors", "chat": {"id": 123}}},
                     {"update_id": 19, "message": {"text": "/shadow", "chat": {"id": 123}}},
+                    {"update_id": 20, "message": {"text": "/execution", "chat": {"id": 123}}},
+                    {"update_id": 21, "message": {"text": "/lessons", "chat": {"id": 123}}},
+                    {"update_id": 22, "message": {"text": "/market", "chat": {"id": 123}}},
                 ]
             }
             with patch("urllib.request.urlopen", return_value=_Response(payload)):
@@ -69,10 +72,13 @@ class NotifyControlsTests(unittest.TestCase):
                     "health",
                     "errors",
                     "shadow",
+                    "execution",
+                    "lessons",
+                    "market",
                 ],
             )
             self.assertEqual(storage.get_state("bot_paused"), "0")
-            self.assertEqual(storage.get_state("telegram_update_offset"), "20")
+            self.assertEqual(storage.get_state("telegram_update_offset"), "23")
 
     def test_setup_commands_registers_function_panel(self):
         captured = {}
@@ -96,7 +102,21 @@ class NotifyControlsTests(unittest.TestCase):
                 Notifier(settings).setup_commands()
 
         self.assertIn("/bot", captured["url"])
-        for command in ("status", "ai", "positions", "training", "health", "errors", "shadow", "stop", "start", "reset"):
+        for command in (
+            "status",
+            "ai",
+            "positions",
+            "training",
+            "health",
+            "errors",
+            "shadow",
+            "execution",
+            "lessons",
+            "market",
+            "stop",
+            "start",
+            "reset",
+        ):
             self.assertIn(command, captured["body"])
 
     def test_send_failure_is_safe(self):

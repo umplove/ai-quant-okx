@@ -47,12 +47,8 @@ class BacktestStorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "bot.sqlite3")
             storage.init()
-            storage.save_intelligence_items(
-                [IntelligenceItem("rss", "BTC-USDT", "Bitcoin listing", "u", 2.0)]
-            )
-            storage.save_trade_review(
-                TradeReview("BTC-USDT", "mark", 100, 110, 1, 10, 10, "profit")
-            )
+            storage.save_intelligence_items([IntelligenceItem("rss", "BTC-USDT", "Bitcoin listing", "u", 2.0)])
+            storage.save_trade_review(TradeReview("BTC-USDT", "mark", 100, 110, 1, 10, 10, "profit"))
 
             intel = storage.recent_intelligence()
             reviews = storage.recent_trade_reviews()
@@ -76,8 +72,20 @@ class BacktestStorageTests(unittest.TestCase):
             storage = Storage(Path(tmp) / "bot.sqlite3")
             storage.init()
             storage.save_ai_call_audit(
-                "BTC-USDT", "buy", True, "buy", 0.9, 1000, 80, 250, "", "ok",
-                prompt_tokens=100, completion_tokens=20, total_tokens=120, retry_count=1,
+                "BTC-USDT",
+                "buy",
+                True,
+                "buy",
+                0.9,
+                1000,
+                80,
+                250,
+                "",
+                "ok",
+                prompt_tokens=100,
+                completion_tokens=20,
+                total_tokens=120,
+                retry_count=1,
             )
 
             summary = storage.recent_ai_call_summary()
@@ -86,19 +94,30 @@ class BacktestStorageTests(unittest.TestCase):
         self.assertIn("buy=1", summary)
         self.assertIn("token=120", summary)
 
-    def test_training_and_shadow_summaries_are_saved(self):
+    def test_training_shadow_execution_and_attribution_summaries_are_saved(self):
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp) / "bot.sqlite3")
             storage.init()
             storage.add_training_usage("2026-W20", 1_000_000_000, 100, 20, 120, True)
             storage.save_shadow_decision("BTC-USDT", "swap", "永续合约影子判断", "hold", 0.8, "风险一般")
+            storage.save_execution_decision(
+                "BTC-USDT", "buy", "buy", "split_limit", "hold", "normal", "fixed", "none", 0.8, "分批挂单"
+            )
+            storage.save_market_regime("震荡", 0.7, "波动收敛")
+            storage.save_trade_attribution("BTC-USDT", -3.0, -0.3, "追高", 0.8, "高位追入", "震荡")
 
             training = storage.training_summary("2026-W20", 1_000_000_000)
             shadows = storage.recent_shadow_decisions()
+            execution = storage.recent_execution_decisions()
+            regimes = storage.recent_market_regimes()
+            attributions = storage.recent_trade_attributions()
 
         self.assertIn("120/1000000000", training)
         self.assertIn("BTC-USDT", shadows[0])
         self.assertIn("swap", shadows[0])
+        self.assertIn("split_limit", execution[0])
+        self.assertIn("震荡", regimes[0])
+        self.assertIn("追高", attributions[0])
 
 
 if __name__ == "__main__":

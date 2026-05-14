@@ -146,6 +146,57 @@ class OkxRestClient:
         )
         return order, self.place_order(order)
 
+    def place_limit_buy_quote(
+        self,
+        symbol: str,
+        quote_amount: float,
+        price: float,
+        reason: str,
+    ) -> tuple[OrderRequest, OrderResult]:
+        base_size = 0.0 if price <= 0 else quote_amount / price
+        order = OrderRequest(
+            symbol=symbol,
+            side=Side.BUY,
+            size=base_size,
+            order_type="limit",
+            price=price,
+            client_order_id=self.client_order_id("LB", symbol),
+            reason=reason,
+        )
+        return order, self.place_order(order)
+
+    def place_limit_sell_base(
+        self,
+        symbol: str,
+        base_size: float,
+        price: float,
+        reason: str,
+    ) -> tuple[OrderRequest, OrderResult]:
+        order = OrderRequest(
+            symbol=symbol,
+            side=Side.SELL,
+            size=base_size,
+            order_type="limit",
+            price=price,
+            client_order_id=self.client_order_id("LS", symbol),
+            reason=reason,
+        )
+        return order, self.place_order(order)
+
+    def cancel_order(self, symbol: str, order_id: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/v5/trade/cancel-order",
+            body={"instId": symbol, "ordId": order_id},
+            auth=True,
+        )
+
+    def list_open_orders(self, symbol: str | None = None) -> dict[str, Any]:
+        params = {"instType": "SPOT"}
+        if symbol:
+            params["instId"] = symbol
+        return self._request("GET", "/api/v5/trade/orders-pending", params=params, auth=True)
+
     def place_stop_loss_order(self, symbol: str, size: float, stop_price: float) -> StopLossOrder:
         client_order_id = self.client_order_id("SL", symbol)
         body = {

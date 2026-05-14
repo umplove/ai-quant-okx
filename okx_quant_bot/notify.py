@@ -39,6 +39,9 @@ class Notifier:
             {"command": "health", "description": "查看线程、DB、Telegram和配置健康状态"},
             {"command": "errors", "description": "查看最近异常、timeout和下单失败"},
             {"command": "shadow", "description": "查看影子全市场最近建议"},
+            {"command": "execution", "description": "查看最近AI执行决策和订单方式"},
+            {"command": "lessons", "description": "查看最近交易归因和经验"},
+            {"command": "market", "description": "查看当前AI行情状态"},
             {"command": "stop", "description": "暂停交易主循环"},
             {"command": "start", "description": "恢复交易主循环"},
             {"command": "reset", "description": "重置资金统计"},
@@ -113,6 +116,12 @@ class Notifier:
                 actions.append("errors")
             elif text == "/shadow":
                 actions.append("shadow")
+            elif text == "/execution":
+                actions.append("execution")
+            elif text == "/lessons":
+                actions.append("lessons")
+            elif text == "/market":
+                actions.append("market")
         self.last_error = ""
         return actions
 

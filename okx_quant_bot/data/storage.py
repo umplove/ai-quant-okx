@@ -257,6 +257,44 @@ class Storage:
                     created_at text default current_timestamp
                 );
 
+                create table if not exists execution_decisions (
+                    id integer primary key autoincrement,
+                    symbol text not null,
+                    intent text not null,
+                    action text not null,
+                    entry_mode text not null,
+                    exit_mode text not null,
+                    size_mode text not null,
+                    stop_mode text not null,
+                    replace_mode text not null,
+                    confidence real not null,
+                    reason text not null,
+                    raw text not null,
+                    created_at text default current_timestamp
+                );
+
+                create table if not exists trade_attributions (
+                    id integer primary key autoincrement,
+                    symbol text not null,
+                    pnl_usdt real not null,
+                    return_pct real not null,
+                    category text not null,
+                    confidence real not null,
+                    reason text not null,
+                    market_regime text not null,
+                    raw text not null,
+                    created_at text default current_timestamp
+                );
+
+                create table if not exists market_regimes (
+                    id integer primary key autoincrement,
+                    regime text not null,
+                    confidence real not null,
+                    reason text not null,
+                    raw text not null,
+                    created_at text default current_timestamp
+                );
+
                 create table if not exists bot_errors (
                     id integer primary key autoincrement,
                     source text not null,
@@ -823,6 +861,153 @@ class Storage:
             f"{r['symbol']} {r['intent']} -> {r['action']} conf={r['confidence']:.2f}: {r['reason']}"
             for r in rows
         ]
+
+    def save_execution_decision(
+        self,
+        symbol: str,
+        intent: str,
+        action: str,
+        entry_mode: str,
+        exit_mode: str,
+        size_mode: str,
+        stop_mode: str,
+        replace_mode: str,
+        confidence: float,
+        reason: str,
+        raw: str = "",
+    ) -> None:
+        with self.session() as conn:
+            conn.execute(
+                """
+                insert into execution_decisions(
+                    symbol, intent, action, entry_mode, exit_mode, size_mode, stop_mode,
+                    replace_mode, confidence, reason, raw
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    symbol,
+                    intent,
+                    action,
+                    entry_mode,
+                    exit_mode,
+                    size_mode,
+                    stop_mode,
+                    replace_mode,
+                    float(confidence),
+                    reason[:1000],
+                    raw[:4000],
+                ),
+            )
+
+    def latest_execution_decision(self, symbol: str, intent: str, max_age_seconds: int = 180) -> dict | None:
+        with self.session() as conn:
+            row = conn.execute(
+                """
+                select *
+                from execution_decisions
+                where symbol = ? and intent = ? and created_at >= datetime('now', ?)
+                order by created_at desc, id desc
+                limit 1
+                """,
+                (symbol, intent, f"-{int(max_age_seconds)} seconds"),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def recent_execution_decisions(self, limit: int = 10) -> list[str]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select symbol, intent, action, entry_mode, exit_mode, size_mode, replace_mode, confidence, reason
+                from execution_decisions
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            f"{r['symbol']} {r['intent']} -> {r['action']} entry={r['entry_mode']} exit={r['exit_mode']} "
+            f"size={r['size_mode']} replace={r['replace_mode']} conf={r['confidence']:.2f}: {r['reason']}"
+            for r in rows
+        ]
+
+    def save_trade_attribution(
+        self,
+        symbol: str,
+        pnl_usdt: float,
+        return_pct: float,
+        category: str,
+        confidence: float,
+        reason: str,
+        market_regime: str = "",
+        raw: str = "",
+    ) -> None:
+        with self.session() as conn:
+            conn.execute(
+                """
+                insert into trade_attributions(
+                    symbol, pnl_usdt, return_pct, category, confidence, reason, market_regime, raw
+                ) values (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    symbol,
+                    float(pnl_usdt),
+                    float(return_pct),
+                    category,
+                    float(confidence),
+                    reason[:1000],
+                    market_regime[:100],
+                    raw[:4000],
+                ),
+            )
+
+    def recent_trade_attributions(self, limit: int = 10) -> list[str]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select symbol, pnl_usdt, return_pct, category, confidence, reason, market_regime
+                from trade_attributions
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            f"{r['symbol']} {r['category']} pnl={r['pnl_usdt']:+.2f} return={r['return_pct']:+.2f}% "
+            f"regime={r['market_regime'] or '未知'} conf={r['confidence']:.2f}: {r['reason']}"
+            for r in rows
+        ]
+
+    def save_market_regime(self, regime: str, confidence: float, reason: str, raw: str = "") -> None:
+        with self.session() as conn:
+            conn.execute(
+                "insert into market_regimes(regime, confidence, reason, raw) values (?, ?, ?, ?)",
+                (regime[:100], float(confidence), reason[:1000], raw[:4000]),
+            )
+
+    def latest_market_regime(self) -> dict | None:
+        with self.session() as conn:
+            row = conn.execute(
+                """
+                select regime, confidence, reason, raw, created_at
+                from market_regimes
+                order by created_at desc, id desc
+                limit 1
+                """
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def recent_market_regimes(self, limit: int = 5) -> list[str]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select regime, confidence, reason, created_at
+                from market_regimes
+                order by created_at desc, id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [f"{r['created_at']} {r['regime']} conf={r['confidence']:.2f}: {r['reason']}" for r in rows]
 
     def latest_ai_decision(self, symbol: str, intent: str, max_age_seconds: int = 180) -> dict | None:
         with self.session() as conn:

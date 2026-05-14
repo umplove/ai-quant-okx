@@ -88,6 +88,63 @@ class OkxRestClientTests(unittest.TestCase):
         self.assertEqual(captured["body"]["ordType"], "conditional")
         self.assertEqual(captured["body"]["slOrdPx"], "-1")
 
+    def test_place_limit_buy_quote_posts_base_size_limit_payload(self):
+        captured = {}
+        payload = {"code": "0", "data": [{"ordId": "order-1", "sCode": "0"}]}
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return _JsonResponse(payload)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = OkxRestClient(settings_for(Path(tmp) / "bot.sqlite3"))
+            with patch("urllib.request.urlopen", fake_urlopen):
+                request, result = client.place_limit_buy_quote("BTC-USDT", 1000, 50000, "test")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(request.order_type, "limit")
+        self.assertEqual(captured["url"].split("?")[0], "https://www.okx.com/api/v5/trade/order")
+        self.assertEqual(captured["body"]["side"], "buy")
+        self.assertEqual(captured["body"]["ordType"], "limit")
+        self.assertEqual(captured["body"]["px"], "50000")
+        self.assertEqual(captured["body"]["sz"], "0.02")
+
+    def test_cancel_order_posts_cancel_payload(self):
+        captured = {}
+        payload = {"code": "0", "data": [{"ordId": "order-1", "sCode": "0"}]}
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return _JsonResponse(payload)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = OkxRestClient(settings_for(Path(tmp) / "bot.sqlite3"))
+            with patch("urllib.request.urlopen", fake_urlopen):
+                result = client.cancel_order("BTC-USDT", "order-1")
+
+        self.assertEqual(result["code"], "0")
+        self.assertEqual(captured["url"].split("?")[0], "https://www.okx.com/api/v5/trade/cancel-order")
+        self.assertEqual(captured["body"], {"instId": "BTC-USDT", "ordId": "order-1"})
+
+    def test_list_open_orders_uses_spot_pending_orders_endpoint(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            return _JsonResponse({"code": "0", "data": []})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = OkxRestClient(settings_for(Path(tmp) / "bot.sqlite3"))
+            with patch("urllib.request.urlopen", fake_urlopen):
+                result = client.list_open_orders("BTC-USDT")
+
+        self.assertEqual(result["code"], "0")
+        self.assertIn("/api/v5/trade/orders-pending", captured["url"])
+        self.assertIn("instType=SPOT", captured["url"])
+        self.assertIn("instId=BTC-USDT", captured["url"])
+
 class _JsonResponse:
     status = 200
 

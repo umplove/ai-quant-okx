@@ -23,11 +23,16 @@ def _int(name: str, default: int) -> int:
 
 
 def _csv(name: str, default: str = "") -> tuple[str, ...]:
-    return tuple(
-        item.strip()
-        for item in os.getenv(name, default).split(",")
-        if item.strip()
-    )
+    return tuple(item.strip() for item in os.getenv(name, default).split(",") if item.strip())
+
+
+def _float_csv(name: str, default: str = "") -> tuple[float, ...]:
+    values: list[float] = []
+    for item in os.getenv(name, default).split(","):
+        item = item.strip()
+        if item:
+            values.append(float(item))
+    return tuple(values)
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
@@ -119,6 +124,12 @@ class Settings:
     ai_training_enabled: bool = True
     ai_training_workers: int = 4
     ai_weekly_token_target: int = 1_000_000_000
+    ai_execution_decisions_enabled: bool = True
+    limit_order_enabled: bool = True
+    split_order_parts: int = 3
+    partial_sell_fractions: tuple[float, ...] = (0.3, 0.5, 1.0)
+    replace_weak_position_enabled: bool = True
+    market_regime_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -190,14 +201,18 @@ class Settings:
             ai_training_enabled=_bool(os.getenv("AI_TRAINING_ENABLED"), True),
             ai_training_workers=_int("AI_TRAINING_WORKERS", 4),
             ai_weekly_token_target=_int("AI_WEEKLY_TOKEN_TARGET", 1_000_000_000),
+            ai_execution_decisions_enabled=_bool(os.getenv("AI_EXECUTION_DECISIONS_ENABLED"), True),
+            limit_order_enabled=_bool(os.getenv("LIMIT_ORDER_ENABLED"), True),
+            split_order_parts=_int("SPLIT_ORDER_PARTS", 3),
+            partial_sell_fractions=_float_csv("PARTIAL_SELL_FRACTIONS", "0.3,0.5,1.0"),
+            replace_weak_position_enabled=_bool(os.getenv("REPLACE_WEAK_POSITION_ENABLED"), True),
+            market_regime_enabled=_bool(os.getenv("MARKET_REGIME_ENABLED"), True),
         )
 
     def require_safe_trading_config(self) -> None:
         if self.trading_enabled and not self.okx_demo and not self.allow_live_trading:
             raise ValueError("Live trading is blocked unless ALLOW_LIVE_TRADING=true.")
-        if self.trading_enabled and not (
-            self.okx_api_key and self.okx_secret_key and self.okx_passphrase
-        ):
+        if self.trading_enabled and not (self.okx_api_key and self.okx_secret_key and self.okx_passphrase):
             raise ValueError("OKX credentials are required when TRADING_ENABLED=true.")
         if not self.symbols:
             raise ValueError("At least one trading symbol must be configured.")
@@ -231,6 +246,10 @@ class Settings:
             raise ValueError("AI_TRAINING_WORKERS must be positive.")
         if self.ai_weekly_token_target <= 0:
             raise ValueError("AI_WEEKLY_TOKEN_TARGET must be positive.")
+        if self.split_order_parts <= 0:
+            raise ValueError("SPLIT_ORDER_PARTS must be positive.")
+        if not self.partial_sell_fractions or any(value <= 0 or value > 1 for value in self.partial_sell_fractions):
+            raise ValueError("PARTIAL_SELL_FRACTIONS must contain values between 0 and 1.")
 
     def ai_config_warning(self) -> str:
         model = self.openai_model.lower()
