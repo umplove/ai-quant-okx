@@ -38,8 +38,9 @@ class MomentumBotRunner:
         if self.training_pool is None:
             self.training_pool = AiTrainingPool(self.settings, self.storage)
         self.training_pool.start()
-        self._send_startup_diagnostics()
-        self._send_money_report(force=True)
+        if self.settings.telegram_auto_reports:
+            self._send_startup_diagnostics()
+            self._send_money_report(force=True)
 
         while True:
             try:
@@ -48,7 +49,8 @@ class MomentumBotRunner:
                     self.run_once()
             except Exception as exc:
                 self.storage.save_bot_error("main_loop", "主循环异常，机器人会继续运行并等待下一轮。", traceback.format_exc())
-                self.notifier.send(f"主循环异常，机器人会继续运行并等待下一轮: {exc}")
+                if self.settings.telegram_auto_reports:
+                    self.notifier.send(f"主循环异常，机器人会继续运行并等待下一轮: {exc}")
             time.sleep(self.settings.scan_interval_seconds)
 
     def run_once(self) -> MomentumScan:
@@ -1131,14 +1133,16 @@ class MomentumBotRunner:
             )
             self.storage.set_state("okx_sync_status", status)
             if before != after or okx_count != before:
-                self.notifier.send_money(f"OKX持仓 != 本地持仓，已执行同步。{status}")
+                if self.settings.telegram_auto_reports:
+                    self.notifier.send_money(f"OKX持仓 != 本地持仓，已执行同步。{status}")
                 return status
             return ""
         except Exception as exc:
             message = f"OKX同步失败: {exc}"
             self.storage.set_state("okx_sync_status", message)
             self.storage.save_bot_error("okx_sync", message, traceback.format_exc())
-            self.notifier.send_money(message)
+            if self.settings.telegram_auto_reports:
+                self.notifier.send_money(message)
             return message
 
     def _positions_from_okx(self, balance_payload: dict, prices: dict[str, float]) -> list[Position]:

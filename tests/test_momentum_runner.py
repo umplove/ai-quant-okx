@@ -292,7 +292,7 @@ class MomentumRunnerTests(unittest.TestCase):
             self.assertIn("持仓已满", storage.get_state("last_buy_ai_skip_reason"))
             self.assertEqual(exchange.buy_calls, [])
 
-    def test_okx_sync_replaces_local_positions_and_alerts_mismatch(self):
+    def test_okx_sync_replaces_local_positions_without_auto_alert_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "bot.sqlite3"
             storage = Storage(db)
@@ -313,7 +313,8 @@ class MomentumRunnerTests(unittest.TestCase):
 
             self.assertEqual(storage.open_position_count(), 7)
             self.assertEqual(storage.get_state("okx_last_position_count"), "7")
-            self.assertIn("OKX持仓 != 本地持仓", notifier.messages[-1])
+            self.assertEqual(notifier.messages, [])
+            self.assertIn("OKX同步正常", storage.get_state("okx_sync_status"))
 
     def test_buy_ai_candidates_are_capped_by_available_slots(self):
         with tempfile.TemporaryDirectory() as tmp:
