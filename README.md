@@ -9,6 +9,7 @@ The project combines OKX market scanning, momentum scoring, optional AI review, 
 - OKX spot market data, balance checks, market orders, limit orders, cancellation, pending-order queries, and stop-loss algo orders.
 - Demo-trading guardrails enabled by default with `OKX_DEMO=true` and `ALLOW_LIVE_TRADING=false`.
 - Momentum candidate ranking from 24h change, amplitude, volume, public information signals, and historical experience.
+- Short-interval spot momentum mode with default 5-minute scans and up to 5 concurrent spot positions.
 - Optional AI review for buy, sell, market-regime, execution-mode, and trade-attribution decisions.
 - Background AI training and shadow-market evaluation that do not block the main trading loop.
 - Telegram notifications and command controls for status, AI state, positions, training, health, errors, execution decisions, lessons, and market regime.
@@ -24,8 +25,11 @@ The bot is conservative by default:
 - `OKX_DEMO=true` sends OKX demo-trading requests when trading is enabled.
 - `ALLOW_LIVE_TRADING=false` blocks live trading startup when demo mode is off.
 - Limit buy orders remain pending until OKX reports fills; repeated AI buy decisions do not create duplicate pending entries for the same symbol.
+- Momentum positions use a hard exit guard by default: 3% take profit, 2% stop loss, and 1% trailing pullback protection.
+- AI can suggest earlier exits or stop adjustments, but it cannot disable the hard stop-loss boundary.
 - Stop-loss updates replace active stop-loss records instead of stacking multiple active stops for the same position.
 - Prices and base quantities are rounded using OKX instrument metadata (`tickSz`, `lotSz`, `minSz`) before live submission.
+- Real order execution is limited to OKX spot. Margin, swaps, futures, options, grids, and short-side ideas are kept as shadow learning records unless explicitly implemented later.
 
 This repository is not investment advice. Review, test, and operate any automated trading system carefully.
 
@@ -139,14 +143,18 @@ The Compose file mounts `./data` into the container so SQLite state persists acr
 Common settings:
 
 ```env
-SCAN_INTERVAL_SECONDS=30
+SCAN_INTERVAL_SECONDS=300
 CANDIDATE_TOP_N=20
-MAX_OPEN_POSITIONS=1
+MAX_OPEN_POSITIONS=5
 TARGET_POSITION_USDT=1000
 RISK_PER_TRADE_USDT=200
 STOP_MODE=percent
 INITIAL_STOP_LOSS_PCT=0.20
 FIXED_STOP_LOSS_USDT=200
+MOMENTUM_EXIT_GUARD_ENABLED=true
+MOMENTUM_TAKE_PROFIT_PCT=0.03
+MOMENTUM_STOP_LOSS_PCT=0.02
+MOMENTUM_TRAILING_STOP_PCT=0.01
 LIMIT_ORDER_ENABLED=true
 SPLIT_ORDER_PARTS=3
 PARTIAL_SELL_FRACTIONS=0.3,0.5,1.0
@@ -164,6 +172,16 @@ MAX_CONSECUTIVE_LOSSES=3
 
 For demo learning and research, `RISK_HALT_ENABLED=false` keeps the bot collecting experience after losses. For more conservative operation, enable it.
 
+With the defaults above, the momentum runner tries to keep scanning for new spot opportunities every 5 minutes. If there are fewer than 5 open positions and no duplicate pending entry order for a candidate, eligible symbols can continue entering while existing positions are managed independently.
+
+The hard exit guard checks open positions before AI sell decisions:
+
+- `MOMENTUM_TAKE_PROFIT_PCT=0.03`: sell the full spot position near +3%.
+- `MOMENTUM_STOP_LOSS_PCT=0.02`: sell the full spot position near -2%.
+- `MOMENTUM_TRAILING_STOP_PCT=0.01`: after a position has made a new high, sell on a 1% pullback from that high.
+
+Telegram `/positions` includes floating PnL plus approximate distance to take-profit and stop-loss levels when a fresh market snapshot is available. `/execution` includes the active hard-exit settings.
+
 ## AI and Training
 
 AI review can provide structured JSON decisions for:
@@ -173,6 +191,8 @@ AI review can provide structured JSON decisions for:
 - Entry mode choices such as market entry, limit pullback, split limit, breakout confirmation, or wait.
 - Size mode choices such as explore, reduced, normal, or strong.
 - Market-regime classification and trade attribution.
+
+AI decisions are advisory around the hard guard. They may tighten exits or suggest earlier sells, but the configured hard stop-loss and take-profit checks run first.
 
 Training and audit records include prompt characters, response characters, prompt tokens, completion tokens, total tokens, attempted tokens, retry count, task count, success count, and error count when the provider returns those fields or when the bot can estimate attempts.
 

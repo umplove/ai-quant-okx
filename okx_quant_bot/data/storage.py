@@ -489,6 +489,21 @@ class Storage:
                 ],
             )
 
+    def latest_market_prices(self) -> dict[str, float]:
+        with self.session() as conn:
+            rows = conn.execute(
+                """
+                select symbol, last
+                from market_snapshots
+                where id in (
+                    select max(id)
+                    from market_snapshots
+                    group by symbol
+                )
+                """
+            ).fetchall()
+        return {str(row["symbol"]): float(row["last"]) for row in rows}
+
     def save_info_signals(self, signals: Iterable[InfoSignal]) -> None:
         with self.session() as conn:
             conn.executemany(

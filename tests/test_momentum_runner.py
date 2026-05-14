@@ -184,7 +184,7 @@ class MomentumRunnerTests(unittest.TestCase):
             db = Path(tmp) / "bot.sqlite3"
             storage = Storage(db)
             storage.init()
-            storage.save_position(Position("AAA-USDT", 5, 1, 1))
+            storage.save_position(Position("AAA-USDT", 5, 2, 2))
             settings = _trading_settings(db, ("AAA-USDT",))
             exchange = _TradingExchange([MarketTicker("AAA-USDT", 2, 1, 2, 1, 1000, 1)])
             runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
@@ -202,7 +202,7 @@ class MomentumRunnerTests(unittest.TestCase):
             db = Path(tmp) / "bot.sqlite3"
             storage = Storage(db)
             storage.init()
-            storage.save_position(Position("AAA-USDT", 5, 1, 1))
+            storage.save_position(Position("AAA-USDT", 5, 2, 2))
             settings = _trading_settings(db, ("AAA-USDT", "BBB-USDT"), max_open_positions=1)
             settings = settings.__class__(**{**settings.__dict__, "ai_review_max_candidates": 2})
             exchange = _TradingExchange(
@@ -425,6 +425,7 @@ class MomentumRunnerTests(unittest.TestCase):
             storage.init()
             storage.save_position(Position("AAA-USDT", 10, 1, 1))
             settings = _trading_settings(db, ("AAA-USDT",))
+            settings = settings.__class__(**{**settings.__dict__, "momentum_exit_guard_enabled": False})
             settings = settings.__class__(**{**settings.__dict__, "partial_sell_fractions": (0.3, 0.5, 1.0)})
             exchange = _TradingExchange([MarketTicker("AAA-USDT", 2, 1, 2, 1, 1000, 1)])
             runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
@@ -437,6 +438,125 @@ class MomentumRunnerTests(unittest.TestCase):
 
             self.assertEqual(exchange.sell_calls, ["AAA-USDT"])
             self.assertAlmostEqual(storage.get_position("AAA-USDT").base_qty, 7.0)
+
+    def test_hard_take_profit_sells_full_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            storage.save_position(Position("AAA-USDT", 10, 100, 100))
+            settings = _trading_settings(db, ("AAA-USDT",))
+            exchange = _TradingExchange([MarketTicker("AAA-USDT", 103, 100, 103, 99, 1000, 1)])
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+            scan = MomentumScan(tickers=exchange.tickers, info_signals=[], candidates=[])
+
+            runner._sell_positions_with_hard_exit(scan)
+
+            self.assertEqual(exchange.sell_calls, ["AAA-USDT"])
+            self.assertFalse(storage.get_position("AAA-USDT").is_open)
+            self.assertIn("hard_take_profit", storage.recent_strategy_lessons()[0])
+
+    def test_hard_stop_loss_sells_even_when_ai_would_hold(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            storage.save_position(Position("AAA-USDT", 10, 100, 100))
+            settings = _trading_settings(db, ("AAA-USDT",))
+            exchange = _TradingExchange([MarketTicker("AAA-USDT", 98, 97, 99, 96, 1000, 1)])
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+
+            with patch("okx_quant_bot.momentum_runner.AiReviewClient") as client:
+                client.return_value.decide_sell.return_value = _decision("hold")
+                client.return_value.decide_buy.return_value = _decision("hold")
+                runner.run_once()
+
+            self.assertEqual(exchange.sell_calls, ["AAA-USDT"])
+            self.assertFalse(storage.get_position("AAA-USDT").is_open)
+            self.assertIn("hard_stop_loss", storage.recent_strategy_lessons()[0])
+
+    def test_hard_trailing_stop_sells_after_pullback_from_high(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            storage.save_position(Position("AAA-USDT", 10, 100, 102))
+            settings = _trading_settings(db, ("AAA-USDT",))
+            exchange = _TradingExchange([MarketTicker("AAA-USDT", 100.9, 100, 102, 99, 1000, 1)])
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+            scan = MomentumScan(tickers=exchange.tickers, info_signals=[], candidates=[])
+
+            runner._sell_positions_with_hard_exit(scan)
+
+            self.assertEqual(exchange.sell_calls, ["AAA-USDT"])
+            self.assertFalse(storage.get_position("AAA-USDT").is_open)
+            self.assertIn("hard_trailing_stop", storage.recent_strategy_lessons()[0])
+
+    def test_existing_positions_can_fill_remaining_slots_to_five(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            storage.save_position(Position("AAA-USDT", 1, 2, 2))
+            storage.save_position(Position("BBB-USDT", 1, 2, 2))
+            symbols = ("AAA-USDT", "BBB-USDT", "CCC-USDT", "DDD-USDT", "EEE-USDT", "FFF-USDT")
+            settings = _trading_settings(db, symbols, max_open_positions=5)
+            settings = settings.__class__(**{**settings.__dict__, "ai_review_max_candidates": 6})
+            exchange = _TradingExchange(
+                [
+                    MarketTicker("AAA-USDT", 2, 2, 2, 1, 1000, 1),
+                    MarketTicker("BBB-USDT", 2, 2, 2, 1, 1000, 1),
+                    MarketTicker("CCC-USDT", 2, 1, 2, 1, 1000, 1),
+                    MarketTicker("DDD-USDT", 2, 1, 2, 1, 900, 1),
+                    MarketTicker("EEE-USDT", 2, 1, 2, 1, 800, 1),
+                    MarketTicker("FFF-USDT", 2, 1, 2, 1, 700, 1),
+                ]
+            )
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+
+            with patch("okx_quant_bot.momentum_runner.AiReviewClient") as client:
+                client.return_value.decide_sell.return_value = _decision("hold")
+                client.return_value.decide_buy.return_value = _decision("buy")
+                runner.run_once()
+
+            self.assertEqual(exchange.buy_calls, ["CCC-USDT", "DDD-USDT", "EEE-USDT"])
+            self.assertEqual(storage.open_position_count(), 5)
+
+    def test_pending_entry_is_skipped_but_other_symbols_can_fill_slots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            storage.save_position(Position("AAA-USDT", 1, 2, 2))
+            storage.save_position(Position("BBB-USDT", 1, 2, 2))
+            request = OrderRequest("CCC-USDT", Side.BUY, 5, "limit", 2, "LBUYCCC", "test")
+            storage.save_order(
+                request,
+                OrderResult(True, "CCC-USDT", Side.BUY, "ord-1", "LBUYCCC", {"data": [{"ordId": "ord-1"}]}),
+                status="pending",
+            )
+            symbols = ("AAA-USDT", "BBB-USDT", "CCC-USDT", "DDD-USDT", "EEE-USDT", "FFF-USDT")
+            settings = _trading_settings(db, symbols, max_open_positions=5)
+            settings = settings.__class__(**{**settings.__dict__, "ai_review_max_candidates": 6})
+            exchange = _TradingExchange(
+                [
+                    MarketTicker("AAA-USDT", 2, 2, 2, 1, 1000, 1),
+                    MarketTicker("BBB-USDT", 2, 2, 2, 1, 1000, 1),
+                    MarketTicker("CCC-USDT", 2, 1, 2, 1, 1000, 1),
+                    MarketTicker("DDD-USDT", 2, 1, 2, 1, 900, 1),
+                    MarketTicker("EEE-USDT", 2, 1, 2, 1, 800, 1),
+                    MarketTicker("FFF-USDT", 2, 1, 2, 1, 700, 1),
+                ]
+            )
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+
+            with patch("okx_quant_bot.momentum_runner.AiReviewClient") as client:
+                client.return_value.decide_sell.return_value = _decision("hold")
+                client.return_value.decide_buy.return_value = _decision("buy")
+                runner.run_once()
+
+            self.assertEqual(exchange.buy_calls, ["DDD-USDT", "EEE-USDT", "FFF-USDT"])
+            self.assertEqual(len(storage.pending_entry_orders("CCC-USDT")), 1)
 
     def test_control_messages_for_execution_lessons_and_market(self):
         with tempfile.TemporaryDirectory() as tmp:

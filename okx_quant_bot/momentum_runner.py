@@ -57,6 +57,7 @@ class MomentumBotRunner:
         self.storage.save_intelligence_items(scan.intelligence_items or [])
         self.storage.save_candidate_scores(scan.candidates)
         self._sync_pending_entry_orders(scan)
+        self._sell_positions_with_hard_exit(scan)
         self._review_open_trades(scan)
 
         self._collect_finished_ai_tasks()
@@ -409,6 +410,29 @@ class MomentumBotRunner:
 
     def _sell_positions_with_ai(self, scan: MomentumScan) -> None:
         self._sell_positions_with_recent_ai(scan)
+
+    def _sell_positions_with_hard_exit(self, scan: MomentumScan) -> None:
+        if not self.settings.momentum_exit_guard_enabled:
+            return
+        prices = {ticker.symbol: ticker.last for ticker in scan.tickers}
+        for position in self.storage.open_positions():
+            price = prices.get(position.symbol)
+            if price is None or price <= 0 or position.avg_entry_price <= 0:
+                continue
+            prior_highest = max(position.highest_price, position.avg_entry_price)
+            if price > prior_highest:
+                position = Position(position.symbol, position.base_qty, position.avg_entry_price, price)
+                self.storage.save_position(position)
+                prior_highest = price
+            take_profit_price = position.avg_entry_price * (1.0 + self.settings.momentum_take_profit_pct)
+            stop_loss_price = position.avg_entry_price * (1.0 - self.settings.momentum_stop_loss_pct)
+            trailing_price = prior_highest * (1.0 - self.settings.momentum_trailing_stop_pct)
+            if price >= take_profit_price:
+                self._sell_position(position, price, "hard_take_profit", fraction=1.0)
+            elif price <= stop_loss_price:
+                self._sell_position(position, price, "hard_stop_loss", fraction=1.0)
+            elif prior_highest > position.avg_entry_price and price <= trailing_price:
+                self._sell_position(position, price, "hard_trailing_stop", fraction=1.0)
 
     def _sell_position(self, position: Position, current_price: float, reason: str, fraction: float = 1.0) -> None:
         sell_qty = position.base_qty * max(0.0, min(fraction, 1.0))
@@ -801,6 +825,10 @@ class MomentumBotRunner:
             "limit_order_enabled": self.settings.limit_order_enabled,
             "replace_weak_position_enabled": self.settings.replace_weak_position_enabled,
             "risk_halt_enabled": self.settings.risk_halt_enabled,
+            "momentum_exit_guard_enabled": self.settings.momentum_exit_guard_enabled,
+            "momentum_take_profit_pct": self.settings.momentum_take_profit_pct,
+            "momentum_stop_loss_pct": self.settings.momentum_stop_loss_pct,
+            "momentum_trailing_stop_pct": self.settings.momentum_trailing_stop_pct,
         }
         self.storage.save_config_snapshot(json.dumps(payload, ensure_ascii=False))
 
@@ -817,6 +845,7 @@ class MomentumBotRunner:
                     f"持仓上限={self.settings.max_open_positions}; 扫描间隔={self.settings.scan_interval_seconds}s",
                     f"AI候选=top {self.settings.ai_review_max_candidates}; 探索比例={self.settings.ai_exploration_fraction:.0%}",
                     f"执行决策={'开启' if self.settings.ai_execution_decisions_enabled else '关闭'}; 限价单={'开启' if self.settings.limit_order_enabled else '关闭'}",
+                    f"硬退出={'开启' if self.settings.momentum_exit_guard_enabled else '关闭'}; 止盈={self.settings.momentum_take_profit_pct:.1%}; 止损={self.settings.momentum_stop_loss_pct:.1%}; 移动止盈={self.settings.momentum_trailing_stop_pct:.1%}",
                     f"风险熔断={'开启' if self.settings.risk_halt_enabled else '关闭'}; OKX技能信号源={len(self.settings.okx_skill_signal_urls)}",
                     f"AI配置提醒: {warning or '正常'}",
                 ]
@@ -841,11 +870,26 @@ class MomentumBotRunner:
         positions = self.storage.open_positions()
         if not positions:
             return "当前没有持仓。"
+        prices = self.storage.latest_market_prices()
         lines = ["当前持仓:"]
         for position in positions:
-            lines.append(
-                f"- {position.symbol}: 数量{position.base_qty:.8g}, 成本{position.avg_entry_price:.8g}, 最高{position.highest_price:.8g}"
-            )
+            price = prices.get(position.symbol)
+            if price and position.avg_entry_price > 0:
+                pnl = (price - position.avg_entry_price) * position.base_qty
+                return_pct = (price - position.avg_entry_price) / position.avg_entry_price * 100.0
+                take_profit_price = position.avg_entry_price * (1.0 + self.settings.momentum_take_profit_pct)
+                stop_loss_price = position.avg_entry_price * (1.0 - self.settings.momentum_stop_loss_pct)
+                to_take_profit = (take_profit_price - price) / price * 100.0
+                to_stop_loss = (price - stop_loss_price) / price * 100.0
+                lines.append(
+                    f"- {position.symbol}: 数量{position.base_qty:.8g}, 成本{position.avg_entry_price:.8g}, "
+                    f"现价{price:.8g}, 浮盈{pnl:+.2f}USDT/{return_pct:+.2f}%, "
+                    f"距止盈{to_take_profit:+.2f}%, 距止损{to_stop_loss:+.2f}%"
+                )
+            else:
+                lines.append(
+                    f"- {position.symbol}: 数量{position.base_qty:.8g}, 成本{position.avg_entry_price:.8g}, 最高{position.highest_price:.8g}"
+                )
         decisions = self.storage.recent_ai_decisions(limit=6)
         if decisions:
             lines.extend(["最近AI意见:", *decisions])
@@ -905,9 +949,15 @@ class MomentumBotRunner:
 
     def _execution_message(self) -> str:
         decisions = self.storage.recent_execution_decisions(limit=12)
+        guard = (
+            f"硬退出: {'开启' if self.settings.momentum_exit_guard_enabled else '关闭'}; "
+            f"止盈={self.settings.momentum_take_profit_pct:.1%}; "
+            f"止损={self.settings.momentum_stop_loss_pct:.1%}; "
+            f"移动止盈回撤={self.settings.momentum_trailing_stop_pct:.1%}"
+        )
         if not decisions:
-            return "暂无AI执行决策。"
-        return "\n".join(["最近AI执行决策:", *decisions])
+            return "\n".join([guard, "暂无AI执行决策。"])
+        return "\n".join([guard, "最近AI执行决策:", *decisions])
 
     def _lessons_message(self) -> str:
         lessons = self.storage.recent_trade_attributions(limit=12)

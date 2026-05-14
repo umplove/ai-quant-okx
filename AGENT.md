@@ -20,6 +20,9 @@
 - Filled or partially filled limit orders are reconciled into positions by incremental filled size only.
 - Active stop-loss records are replaced rather than stacked; full exits cancel active stop-loss records.
 - OKX `tickSz`, `lotSz`, and `minSz` are used to round or reject live order payloads before submission.
+- Momentum mode defaults to short-interval spot trading: `SCAN_INTERVAL_SECONDS=300`, `MAX_OPEN_POSITIONS=5`.
+- Momentum hard exits run before AI sell decisions when enabled: `MOMENTUM_TAKE_PROFIT_PCT=0.03`, `MOMENTUM_STOP_LOSS_PCT=0.02`, `MOMENTUM_TRAILING_STOP_PCT=0.01`.
+- Real execution remains spot-only. Short-side, margin, swaps, futures, options, grids, and similar ideas are shadow learning only unless explicitly implemented later.
 
 ## Git and Documentation Rules
 - After any file update, update this `AGENT.md` when the change affects project behavior, workflow, or handoff context.

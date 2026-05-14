@@ -87,15 +87,19 @@ class Settings:
     max_consecutive_losses: int
     telegram_bot_token: str
     telegram_chat_id: str
-    scan_interval_seconds: int = 30
+    scan_interval_seconds: int = 300
     candidate_top_n: int = 20
     risk_per_trade_usdt: float = 200.0
     target_position_usdt: float = 1000.0
     stop_mode: str = "percent"
     initial_stop_loss_pct: float = 0.20
     fixed_stop_loss_usdt: float = 200.0
-    max_open_positions: int = 1
+    max_open_positions: int = 5
     risk_halt_enabled: bool = False
+    momentum_exit_guard_enabled: bool = True
+    momentum_take_profit_pct: float = 0.03
+    momentum_stop_loss_pct: float = 0.02
+    momentum_trailing_stop_pct: float = 0.01
     news_rss_urls: tuple[str, ...] = ()
     news_scan_aggressive: bool = True
     intelligence_max_items: int = 30
@@ -164,15 +168,19 @@ class Settings:
             max_consecutive_losses=_int("MAX_CONSECUTIVE_LOSSES", 3),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
-            scan_interval_seconds=_int("SCAN_INTERVAL_SECONDS", 30),
+            scan_interval_seconds=_int("SCAN_INTERVAL_SECONDS", 300),
             candidate_top_n=_int("CANDIDATE_TOP_N", 20),
             risk_per_trade_usdt=_float("RISK_PER_TRADE_USDT", 200.0),
             target_position_usdt=_float("TARGET_POSITION_USDT", 1000.0),
             stop_mode=os.getenv("STOP_MODE", "percent").strip().lower(),
             initial_stop_loss_pct=_float("INITIAL_STOP_LOSS_PCT", 0.20),
             fixed_stop_loss_usdt=_float("FIXED_STOP_LOSS_USDT", 200.0),
-            max_open_positions=_int("MAX_OPEN_POSITIONS", 1),
+            max_open_positions=_int("MAX_OPEN_POSITIONS", 5),
             risk_halt_enabled=_bool(os.getenv("RISK_HALT_ENABLED"), False),
+            momentum_exit_guard_enabled=_bool(os.getenv("MOMENTUM_EXIT_GUARD_ENABLED"), True),
+            momentum_take_profit_pct=_float("MOMENTUM_TAKE_PROFIT_PCT", 0.03),
+            momentum_stop_loss_pct=_float("MOMENTUM_STOP_LOSS_PCT", 0.02),
+            momentum_trailing_stop_pct=_float("MOMENTUM_TRAILING_STOP_PCT", 0.01),
             news_rss_urls=_csv("NEWS_RSS_URLS"),
             news_scan_aggressive=_bool(os.getenv("NEWS_SCAN_AGGRESSIVE"), True),
             intelligence_max_items=_int("INTELLIGENCE_MAX_ITEMS", 30),
@@ -222,6 +230,12 @@ class Settings:
             raise ValueError("INITIAL_STOP_LOSS_PCT must be between 0 and 1.")
         if self.risk_per_trade_usdt <= 0 or self.fixed_stop_loss_usdt <= 0:
             raise ValueError("Risk settings must be positive.")
+        if self.momentum_take_profit_pct <= 0 or self.momentum_take_profit_pct >= 1:
+            raise ValueError("MOMENTUM_TAKE_PROFIT_PCT must be between 0 and 1.")
+        if self.momentum_stop_loss_pct <= 0 or self.momentum_stop_loss_pct >= 1:
+            raise ValueError("MOMENTUM_STOP_LOSS_PCT must be between 0 and 1.")
+        if self.momentum_trailing_stop_pct <= 0 or self.momentum_trailing_stop_pct >= 1:
+            raise ValueError("MOMENTUM_TRAILING_STOP_PCT must be between 0 and 1.")
         if self.money_report_interval_scans <= 0:
             raise ValueError("MONEY_REPORT_INTERVAL_SCANS must be positive.")
         if self.intelligence_max_items <= 0:
