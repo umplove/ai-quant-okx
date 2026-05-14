@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
@@ -28,6 +29,9 @@ class MomentumBotRunner:
     _ai_executor: ThreadPoolExecutor | None = field(default=None, init=False, repr=False)
     _pending_ai: dict[str, Future] = field(default_factory=dict, init=False, repr=False)
     _exited_symbols: set[str] = field(default_factory=set, init=False, repr=False)
+    _controls_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _controls_stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    _controls_thread: threading.Thread | None = field(default=None, init=False, repr=False)
 
     def run_forever(self) -> None:
         self.settings.require_safe_trading_config()
@@ -38,13 +42,14 @@ class MomentumBotRunner:
         if self.training_pool is None:
             self.training_pool = AiTrainingPool(self.settings, self.storage)
         self.training_pool.start()
+        self._start_control_thread()
         if self.settings.telegram_auto_reports:
             self._send_startup_diagnostics()
             self._send_money_report(force=True)
 
         while True:
             try:
-                self._handle_controls()
+                self._handle_controls_safely("loop_start")
                 if not self._is_paused():
                     self.run_once()
             except Exception as exc:
@@ -1355,13 +1360,43 @@ class MomentumBotRunner:
             elif action == "market":
                 self.notifier.send(self._market_message())
 
-    def _handle_controls_safely(self, stage: str) -> None:
-        self.storage.set_state("runtime_stage", stage)
-        self.storage.set_state("runtime_stage_updated_at", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
+    def _start_control_thread(self) -> None:
+        if not (
+            self.settings.telegram_controls_enabled
+            and self.settings.telegram_bot_token
+            and self.settings.telegram_chat_id
+        ):
+            return
+        if self._controls_thread is not None and self._controls_thread.is_alive():
+            return
+        self._controls_stop.clear()
+        self._controls_thread = threading.Thread(
+            target=self._control_thread_loop,
+            name="telegram-controls",
+            daemon=True,
+        )
+        self._controls_thread.start()
+        self.storage.set_state("telegram_control_thread", "running")
+
+    def _control_thread_loop(self) -> None:
+        while not self._controls_stop.is_set():
+            self._handle_controls_safely("telegram_controls", update_runtime_stage=False)
+            self._controls_stop.wait(3.0)
+
+    def _handle_controls_safely(self, stage: str, update_runtime_stage: bool = True) -> None:
+        if not self._controls_lock.acquire(blocking=False):
+            return
         try:
+            now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+            if update_runtime_stage:
+                self.storage.set_state("runtime_stage", stage)
+                self.storage.set_state("runtime_stage_updated_at", now)
+            self.storage.set_state("telegram_control_last_poll_at", now)
             self._handle_controls()
         except Exception as exc:
             self.storage.save_bot_error("telegram_controls", f"控制命令处理失败: {stage}", str(exc))
+        finally:
+            self._controls_lock.release()
 
     def _sleep_with_controls(self, seconds: int | float) -> None:
         remaining = max(0.0, float(seconds))
@@ -1505,6 +1540,8 @@ class MomentumBotRunner:
         pending_ai = sum(1 for future in self._pending_ai.values() if not future.done())
         stage = self.storage.get_state("runtime_stage", "unknown")
         stage_at = self.storage.get_state("runtime_stage_updated_at", "")
+        control_thread = self.storage.get_state("telegram_control_thread", "stopped")
+        control_poll_at = self.storage.get_state("telegram_control_last_poll_at", "")
         db_status = "正常"
         try:
             self.storage.open_position_count()
@@ -1514,6 +1551,7 @@ class MomentumBotRunner:
             [
                 "健康状态:",
                 f"DB: {db_status}",
+                f"Telegram control thread: {control_thread} {control_poll_at}",
                 f"Telegram: {'正常' if not getattr(self.notifier, 'last_error', '') else '异常: ' + self.notifier.last_error[:120]}",
                 f"AI配置: {warning or '正常'}",
                 f"AI后台决策: pending={pending_ai}",

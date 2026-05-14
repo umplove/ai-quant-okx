@@ -1,5 +1,7 @@
 import tempfile
+import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -417,6 +419,31 @@ class MomentumRunnerTests(unittest.TestCase):
             self.assertTrue(notifier.messages)
             self.assertIn("OKX总权益", notifier.messages[0])
             self.assertEqual(storage.get_state("runtime_stage"), "sleep")
+
+    def test_background_control_thread_polls_manual_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            settings = replace(settings_for(db), telegram_bot_token="token", telegram_chat_id="chat")
+            notifier = _Notifier(actions=["status"])
+            runner = MomentumBotRunner(settings, storage, _Exchange(), notifier)
+
+            runner._start_control_thread()
+            try:
+                for _ in range(20):
+                    if notifier.messages:
+                        break
+                    time.sleep(0.05)
+            finally:
+                runner._controls_stop.set()
+                if runner._controls_thread is not None:
+                    runner._controls_thread.join(timeout=1.0)
+
+            self.assertTrue(notifier.messages)
+            self.assertIn("OKX总权益", notifier.messages[0])
+            self.assertEqual(storage.get_state("telegram_control_thread"), "running")
+            self.assertTrue(storage.get_state("telegram_control_last_poll_at", ""))
 
     def test_manual_ai_and_training_messages_are_chinese(self):
         with tempfile.TemporaryDirectory() as tmp:
