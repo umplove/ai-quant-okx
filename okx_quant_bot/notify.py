@@ -36,19 +36,19 @@ class Notifier:
         if not (self.settings.telegram_controls_enabled and self.settings.telegram_bot_token):
             return False
         commands = [
-            {"command": "status", "description": "Show account, positions and recent orders"},
-            {"command": "ai", "description": "Show AI config, calls and errors"},
-            {"command": "positions", "description": "Show current positions"},
-            {"command": "training", "description": "Show AI training token progress"},
-            {"command": "health", "description": "Show runtime health"},
-            {"command": "errors", "description": "Show recent errors"},
-            {"command": "shadow", "description": "Show legacy shadow decisions"},
-            {"command": "execution", "description": "Show AI execution decisions and orders"},
-            {"command": "lessons", "description": "Show trade lessons and attribution"},
-            {"command": "market", "description": "Show AI market regime"},
-            {"command": "stop", "description": "Pause trading loop"},
-            {"command": "start", "description": "Resume trading loop"},
-            {"command": "reset", "description": "Reset money baseline"},
+            {"command": "status", "description": "查看资产、持仓和最近订单"},
+            {"command": "ai", "description": "查看AI配置、调用和错误统计"},
+            {"command": "positions", "description": "查看当前持仓"},
+            {"command": "training", "description": "查看AI训练和经验入库"},
+            {"command": "health", "description": "查看运行健康状态"},
+            {"command": "errors", "description": "查看最近异常"},
+            {"command": "shadow", "description": "查看旧影子记录"},
+            {"command": "execution", "description": "查看AI决策和真实订单"},
+            {"command": "lessons", "description": "查看交易归因和经验"},
+            {"command": "market", "description": "查看AI行情状态"},
+            {"command": "stop", "description": "暂停交易主循环"},
+            {"command": "start", "description": "恢复交易主循环"},
+            {"command": "reset", "description": "重置资金统计"},
         ]
         try:
             token = self.settings.telegram_bot_token

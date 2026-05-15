@@ -54,7 +54,8 @@ class MomentumBotRunner:
                     self.run_once()
             except Exception as exc:
                 self.storage.save_bot_error("main_loop", "主循环异常，机器人会继续运行并等待下一轮。", traceback.format_exc())
-                if self.settings.telegram_auto_reports:
+                print(f"Main loop error: {exc}", flush=True)
+                if self.settings.telegram_auto_reports and self.storage.get_state("telegram_error_reports", "0") == "1":
                     self.notifier.send(f"主循环异常，机器人会继续运行并等待下一轮: {exc}")
             self._sleep_with_controls(self.settings.scan_interval_seconds)
 
