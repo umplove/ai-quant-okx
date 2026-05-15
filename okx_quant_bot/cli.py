@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 from pathlib import Path
 
 from okx_quant_bot.backtest import load_candles_csv, run_backtest
@@ -38,6 +39,13 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("scan-momentum")
     sub.add_parser("run-momentum")
     sub.add_parser("telegram-diagnose")
+    delete_webhook = sub.add_parser("telegram-delete-webhook")
+    delete_webhook.add_argument("--drop-pending-updates", action="store_true")
+    live_db = sub.add_parser("prepare-live-db")
+    live_db.add_argument("--source", type=Path, default=None)
+    live_db.add_argument("--dest", type=Path, default=Path("data/live.sqlite3"))
+    live_db.add_argument("--overwrite", action="store_true")
+    sub.add_parser("live-readiness")
 
     args = parser.parse_args(argv)
     settings = Settings.from_env()
@@ -149,5 +157,113 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
+    if args.command == "telegram-delete-webhook":
+        notifier = Notifier(settings)
+        ok = notifier.delete_webhook(drop_pending_updates=args.drop_pending_updates)
+        print("Telegram deleteWebhook: OK" if ok else f"Telegram deleteWebhook: FAILED {notifier.last_error}")
+        return 0 if ok else 1
+
+    if args.command == "prepare-live-db":
+        source = args.source or settings.db_path
+        _prepare_live_db(source, args.dest, overwrite=args.overwrite)
+        print(f"Prepared live DB at {args.dest} from {source}")
+        return 0
+
+    if args.command == "live-readiness":
+        storage.init()
+        report, ok = _live_readiness_report(settings)
+        print(report)
+        return 0 if ok else 1
+
     parser.error("unknown command")
     return 2
+
+
+def _prepare_live_db(source: Path, dest: Path, overwrite: bool = False) -> None:
+    source = source.expanduser()
+    dest = dest.expanduser()
+    if source.resolve() == dest.resolve():
+        raise ValueError("source and dest DB must be different")
+    if dest.exists() and not overwrite:
+        raise ValueError(f"{dest} already exists; pass --overwrite to replace inherited experience tables")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    Storage(dest).init()
+    tables = ("real_experiences", "experience_scores", "trade_attributions", "ai_training_runs", "market_regimes")
+    with sqlite3.connect(dest) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("attach database ? as src", (str(source),))
+        for table in tables:
+            conn.execute(f"delete from {table}")
+            dest_columns = _table_columns(conn, "main", table)
+            source_columns = _table_columns(conn, "src", table)
+            columns = [column for column in dest_columns if column in source_columns]
+            column_csv = ", ".join(columns)
+            conn.execute(f"insert into {table}({column_csv}) select {column_csv} from src.{table}")
+        conn.commit()
+        conn.execute("detach database src")
+
+
+def _table_columns(conn: sqlite3.Connection, schema: str, table: str) -> list[str]:
+    return [str(row["name"]) for row in conn.execute(f"pragma {schema}.table_info({table})").fetchall()]
+
+
+def _live_readiness_report(settings: Settings) -> tuple[str, bool]:
+    db_path = settings.db_path
+    lines = [
+        "Live readiness:",
+        f"DB_PATH={db_path}",
+        f"TRADING_ENABLED={settings.trading_enabled} OKX_DEMO={settings.okx_demo} ALLOW_LIVE_TRADING={settings.allow_live_trading}",
+        f"markets={','.join(settings.enabled_market_types)} max_open_positions={settings.max_open_positions}",
+    ]
+    blockers: list[str] = []
+    warnings: list[str] = []
+
+    try:
+        settings.require_safe_trading_config()
+    except Exception as exc:
+        blockers.append(str(exc))
+
+    with sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True) as conn:
+        conn.row_factory = sqlite3.Row
+        telegram_409 = _count(conn, "select count(*) from bot_errors where source='telegram_poll' and details like '%409%'")
+        errors_24h = _count(conn, "select count(*) from bot_errors where created_at >= datetime('now','-1 day')")
+        swap_rejected = _count(conn, "select count(*) from orders where side='sell' and status='rejected' and symbol like '%-SWAP'")
+        spot_sell_rejected = _count(conn, "select count(*) from orders where side='sell' and status='rejected' and market_type='SPOT'")
+        spot_sell_filled = _count(conn, "select count(*) from orders where side='sell' and status='filled' and market_type='SPOT'")
+        live_positions = _count(conn, "select count(*) from positions where base_qty > 0")
+        experiences = _count(conn, "select count(*) from real_experiences")
+
+    lines.extend(
+        [
+            f"real_experiences={experiences}",
+            f"open_positions={live_positions}",
+            f"bot_errors_24h={errors_24h}",
+            f"telegram_409_errors={telegram_409}",
+            f"swap_sell_rejected={swap_rejected}",
+            f"spot_sell filled/rejected={spot_sell_filled}/{spot_sell_rejected}",
+        ]
+    )
+
+    if telegram_409:
+        blockers.append("Telegram has HTTP 409 conflicts; stop old polling instance or delete webhook before live trading.")
+    if swap_rejected:
+        warnings.append("SWAP sell rejects exist in demo history; strict live gate keeps live trading SPOT-only.")
+    if spot_sell_rejected > max(1, spot_sell_filled):
+        blockers.append("SPOT sell rejected count is too high versus filled sells.")
+    if db_path == Path("data/bot.sqlite3"):
+        blockers.append("Default demo DB is configured; use data/live.sqlite3 for live trading.")
+
+    if blockers:
+        lines.append("BLOCKERS:")
+        lines.extend(f"- {item}" for item in blockers)
+    if warnings:
+        lines.append("WARNINGS:")
+        lines.extend(f"- {item}" for item in warnings)
+    if not blockers:
+        lines.append("OK: strict live readiness gates passed.")
+    return "\n".join(lines), not blockers
+
+
+def _count(conn: sqlite3.Connection, sql: str) -> int:
+    row = conn.execute(sql).fetchone()
+    return int(row[0] if row else 0)

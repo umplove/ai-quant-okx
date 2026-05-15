@@ -252,6 +252,17 @@ class Settings:
     def require_safe_trading_config(self) -> None:
         if self.trading_enabled and not self.okx_demo and not self.allow_live_trading:
             raise ValueError("Live trading is blocked unless ALLOW_LIVE_TRADING=true.")
+        if self.trading_enabled and not self.okx_demo:
+            if self.simulated_trading_header:
+                raise ValueError("Live trading requires OKX_SIMULATED_TRADING_HEADER=false.")
+            if tuple(self.enabled_market_types) != ("SPOT",):
+                raise ValueError("Strict live trading gate only allows ENABLED_MARKET_TYPES=SPOT.")
+            if self.allow_leveraged_trading or self.allow_derivatives_trading:
+                raise ValueError("Strict live trading gate requires leveraged and derivatives trading disabled.")
+            if self.db_path == Path("data/bot.sqlite3"):
+                raise ValueError("Live trading requires an isolated DB_PATH such as data/live.sqlite3.")
+            if self.max_open_positions > 2:
+                raise ValueError("Strict live trading gate allows at most 2 open positions.")
         if self.trading_enabled and not (self.okx_api_key and self.okx_secret_key and self.okx_passphrase):
             raise ValueError("OKX credentials are required when TRADING_ENABLED=true.")
         allowed_markets = {"SPOT", "MARGIN", "SWAP"}

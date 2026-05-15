@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from okx_quant_bot.backtest import run_backtest
+from okx_quant_bot.cli import _prepare_live_db
 from okx_quant_bot.data import Storage
 from okx_quant_bot.models import Candle, IntelligenceItem, OrderRequest, OrderResult, Position, Side, TradeReview
 from okx_quant_bot.strategy import TrendPullbackStrategy
@@ -141,6 +142,29 @@ class BacktestStorageTests(unittest.TestCase):
         self.assertIn("规则合成 buy/sell=1/0", summary)
         self.assertIn("OKX真实订单 buy/sell=1/0", summary)
         self.assertIn("filled=1", summary)
+
+    def test_prepare_live_db_copies_experience_but_not_orders_or_positions(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            source = Path(tmp) / "bot.sqlite3"
+            dest = Path(tmp) / "live.sqlite3"
+            storage = Storage(source)
+            storage.init()
+            storage.save_real_experience("BTC-USDT", "SPOT", "long", "", "buy", "profit", reason="ok", source="test")
+            storage.save_trade_attribution("BTC-USDT", 1.0, 1.0, "profit", 0.8, "ok", "trend")
+            storage.save_position(Position("BTC-USDT", 1, 100, 100))
+            request = OrderRequest("BTC-USDT", Side.BUY, 100, "market", None, "CL1", "test")
+            storage.save_order(
+                request,
+                OrderResult(True, "BTC-USDT", Side.BUY, "OKX1", "CL1", {"data": [{"ordId": "OKX1", "state": "filled"}]}),
+            )
+
+            _prepare_live_db(source, dest)
+            live = Storage(dest)
+
+            self.assertIn("profit", live.real_experience_summary())
+            self.assertTrue(live.recent_trade_attributions())
+            self.assertEqual(live.open_position_count(), 0)
+            self.assertIn("OKX真实订单 buy/sell=0/0", live.execution_summary())
 
 
 if __name__ == "__main__":

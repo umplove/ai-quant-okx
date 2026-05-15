@@ -64,6 +64,24 @@ class Notifier:
             print(f"Telegram menu setup failed: {exc}", flush=True)
             return False
 
+    def delete_webhook(self, drop_pending_updates: bool = False) -> bool:
+        if not self.settings.telegram_bot_token:
+            self.last_error = "missing telegram bot token"
+            return False
+        try:
+            token = self.settings.telegram_bot_token
+            url = f"https://api.telegram.org/bot{token}/deleteWebhook"
+            body = urllib.parse.urlencode({"drop_pending_updates": str(drop_pending_updates).lower()}).encode("utf-8")
+            request = urllib.request.Request(url, data=body, method="POST")
+            with urllib.request.urlopen(request, timeout=10) as response:
+                json.loads(response.read().decode("utf-8"))
+            self.last_error = ""
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            print(f"Telegram deleteWebhook failed: {exc}", flush=True)
+            return False
+
     def poll_controls(self, storage) -> list[str]:
         now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         try:

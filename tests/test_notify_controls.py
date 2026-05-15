@@ -143,6 +143,30 @@ class NotifyControlsTests(unittest.TestCase):
         ):
             self.assertIn(command, captured["body"])
 
+    def test_delete_webhook_calls_telegram(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["body"] = request.data.decode("utf-8")
+            return _Response({"ok": True})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = settings_for(Path(tmp) / "bot.sqlite3")
+            settings = settings.__class__(
+                **{
+                    **settings.__dict__,
+                    "telegram_bot_token": "token",
+                    "telegram_chat_id": "123",
+                }
+            )
+            with patch("urllib.request.urlopen", fake_urlopen):
+                ok = Notifier(settings).delete_webhook(drop_pending_updates=True)
+
+        self.assertTrue(ok)
+        self.assertIn("deleteWebhook", captured["url"])
+        self.assertIn("drop_pending_updates=true", captured["body"])
+
     def test_send_failure_is_safe(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = settings_for(Path(tmp) / "bot.sqlite3")
