@@ -153,6 +153,12 @@ class _StopLossFailExchange(_TradingExchange):
         return StopLossOrder(symbol, None, f"SL{symbol}", stop_price, size, False, {}, "stop rejected")
 
 
+class _StopLossCancelFailExchange(_TradingExchange):
+    def cancel_stop_loss_order(self, symbol, algo_id):
+        self.cancel_stop_calls.append((symbol, algo_id))
+        raise RuntimeError("cancel failed")
+
+
 class _SyncExchange(_TradingExchange):
     def __init__(self, tickers, details=None, positions=None, open_orders=None):
         super().__init__(tickers)
@@ -590,6 +596,24 @@ class MomentumRunnerTests(unittest.TestCase):
             self.assertFalse(storage.get_position("AAA-USDT").is_open)
             self.assertEqual(exchange.cancel_stop_calls, [("AAA-USDT", "algo-old")])
             self.assertEqual(storage.active_stop_loss_orders("AAA-USDT"), [])
+
+    def test_spot_sell_blocks_when_stop_loss_cancel_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            storage.save_position(Position("AAA-USDT", 5, 1, 1))
+            storage.save_stop_loss_order(StopLossOrder("AAA-USDT", "algo-old", "SL-OLD", 0.8, 5, True, {}))
+            settings = _trading_settings(db, ("AAA-USDT",))
+            exchange = _StopLossCancelFailExchange([MarketTicker("AAA-USDT", 2, 1, 2, 1, 1000, 1)])
+            runner = MomentumBotRunner(settings, storage, exchange, _Notifier())
+
+            runner._sell_position(storage.get_position("AAA-USDT"), 2, "test")
+
+            self.assertEqual(exchange.cancel_stop_calls, [("AAA-USDT", "algo-old")])
+            self.assertEqual(exchange.sell_calls, [])
+            self.assertTrue(storage.get_position("AAA-USDT").is_open)
+            self.assertIn("failed to cancel active stop loss", storage.execution_summary())
 
     def test_split_limit_places_multiple_orders(self):
         with tempfile.TemporaryDirectory() as tmp:

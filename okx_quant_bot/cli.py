@@ -134,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "telegram-diagnose":
         storage.init()
         notifier = Notifier(settings)
-        actions = notifier.poll_controls(storage)
+        actions = notifier.poll_controls(storage, force=True)
         token_state = "set" if settings.telegram_bot_token else "missing"
         chat_state = "set" if settings.telegram_chat_id else "missing"
         print("Telegram diagnose")

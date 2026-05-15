@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -82,7 +83,7 @@ class Notifier:
             print(f"Telegram deleteWebhook failed: {exc}", flush=True)
             return False
 
-    def poll_controls(self, storage) -> list[str]:
+    def poll_controls(self, storage, force: bool = False) -> list[str]:
         now = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
         try:
             storage.set_state("telegram_poll_started_at", now)
@@ -94,6 +95,17 @@ class Notifier:
             except Exception:
                 pass
             return []
+        if not force:
+            try:
+                backoff_until = float(storage.get_state("telegram_poll_backoff_until", "0") or "0")
+            except Exception:
+                backoff_until = 0.0
+            if backoff_until > time.time():
+                try:
+                    storage.set_state("telegram_poll_status", "conflict_409_backoff")
+                except Exception:
+                    pass
+                return []
         try:
             actions = self._poll_controls(storage)
             storage.set_state("telegram_poll_status", f"ok actions={len(actions)}")
@@ -103,6 +115,15 @@ class Notifier:
             self.last_error = str(exc)
             print(f"Telegram poll failed: {exc}", flush=True)
             try:
+                if _is_telegram_conflict(exc):
+                    storage.set_state("telegram_poll_status", "conflict_409_another_poller_or_webhook")
+                    storage.set_state("telegram_poll_finished_at", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
+                    storage.set_state("telegram_poll_backoff_until", str(time.time() + 60.0))
+                    last_logged = float(storage.get_state("telegram_poll_conflict_logged_at", "0") or "0")
+                    if time.time() - last_logged > 600:
+                        storage.set_state("telegram_poll_conflict_logged_at", str(time.time()))
+                        storage.save_bot_error("telegram_poll", "Telegram poll conflict", str(exc))
+                    return []
                 storage.set_state("telegram_poll_status", f"error: {str(exc)[:200]}")
                 storage.set_state("telegram_poll_finished_at", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()))
                 storage.save_bot_error("telegram_poll", "Telegram poll failed", str(exc))
@@ -195,3 +216,7 @@ def _telegram_message_chunks(message: str) -> list[str]:
     if current:
         chunks.append(current)
     return chunks
+
+
+def _is_telegram_conflict(exc: Exception) -> bool:
+    return isinstance(exc, urllib.error.HTTPError) and exc.code == 409

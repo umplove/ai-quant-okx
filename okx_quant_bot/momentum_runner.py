@@ -718,6 +718,21 @@ class MomentumBotRunner:
         if sell_qty <= 0:
             return
         stop_price = self._current_stop_price(position)
+        canceled_spot_stop = False
+        if self.settings.trading_enabled and position.market_type == "SPOT" and self.storage.active_stop_loss_orders(position.symbol):
+            if not self._cancel_active_stop_losses(position.symbol):
+                self.storage.save_execution_event(
+                    position.symbol,
+                    position.market_type,
+                    position.direction,
+                    "sell",
+                    "sell",
+                    "blocked",
+                    "stop_loss_cancel",
+                    reason="failed to cancel active stop loss before spot sell",
+                )
+                return
+            canceled_spot_stop = True
         if not self.settings.trading_enabled:
             request, result = self._dry_run_sell(position, reason, sell_qty)
         elif position.market_type == "MARGIN":
@@ -747,6 +762,10 @@ class MomentumBotRunner:
         self.storage.save_order(request, result)
         if not result.ok:
             self._record_execution_failure(position.symbol, "卖出失败", result.error or "unknown", result.raw)
+            if canceled_spot_stop:
+                stop_order = self._replace_stop_loss(position, stop_price)
+                if not stop_order.ok:
+                    self._record_execution_failure(position.symbol, "restore_stop_loss_failed", stop_order.error or "unknown", stop_order.raw)
             return
         multiplier = -1.0 if position.direction == "short" else 1.0
         pnl = (current_price - position.avg_entry_price) * sell_qty * multiplier

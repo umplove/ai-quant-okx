@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs
 
 from okx_quant_bot.data import Storage
@@ -103,6 +103,28 @@ class NotifyControlsTests(unittest.TestCase):
 
             self.assertEqual(actions, ["status"])
             self.assertEqual(storage.get_state("telegram_poll_status"), "ok actions=1")
+
+    def test_poll_controls_backs_off_on_telegram_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bot.sqlite3"
+            storage = Storage(db)
+            storage.init()
+            settings = settings_for(db)
+            settings = settings.__class__(
+                **{
+                    **settings.__dict__,
+                    "telegram_bot_token": "token",
+                    "telegram_chat_id": "123",
+                    "telegram_controls_enabled": True,
+                }
+            )
+            conflict = HTTPError("url", 409, "Conflict", hdrs=None, fp=None)
+            with patch("urllib.request.urlopen", side_effect=conflict):
+                actions = Notifier(settings).poll_controls(storage)
+
+            self.assertEqual(actions, [])
+            self.assertIn("conflict_409", storage.get_state("telegram_poll_status"))
+            self.assertTrue(float(storage.get_state("telegram_poll_backoff_until", "0")) > 0)
 
     def test_setup_commands_registers_function_panel(self):
         captured = {}
